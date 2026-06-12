@@ -328,9 +328,31 @@ function kontaktName(id){
 const adresseText = a => !a ? "" : [ [a.strasse,a.hausnummer].filter(Boolean).join(" "), [a.plz,a.ort].filter(Boolean).join(" ") ].filter(Boolean).join(", ");
 const KONTAKT_TYPEN = ["Mieter","Versorger","Handwerker","Versicherer","WEG-Verwalter","Sonstige"];
 const OBJEKT_TYPEN = ["Mehrfamilienhaus","Einfamilienhaus","Eigentumswohnung"];
-const VERTEILER = [["Wohnflaeche","Wohnfläche"],["Personenzahl","Personenzahl"],["Wohneinheiten","Wohneinheiten"],["Verbrauch","Verbrauch (wie Wohnfläche*)"],["Direktzuordnung","Direktzuordnung"]];
+const VERTEILER = [["Wohnflaeche","Wohnfläche"],["Personenzahl","Personenzahl"],["Wohneinheiten","Wohneinheiten"],["Verbrauch","Verbrauch (Zähler)"],["Direktzuordnung","Direktzuordnung"]];
 const verteilerName = v => (VERTEILER.find(x=>x[0]===v)||["","?"])[1];
 
+
+const ZAEHLER_TYPEN = ["Heizung","Warmwasser","Kaltwasser","Gas","StromAllgemein","StromSondereigentum"];
+/* Kostenart → Zählertyp für die Verbrauchsverteilung */
+function zaehlerTypFuerKostenart(betrKvNummer){
+  if (betrKvNummer===4 || betrKvNummer===6) return "Heizung";
+  if (betrKvNummer===5) return "Warmwasser";
+  if (betrKvNummer===2 || betrKvNummer===3) return "Kaltwasser";
+  return null;
+}
+/* Verbrauch einer Wohneinheit für einen Typ im Zeitraum (Differenz der Ablesungen). null = keine Daten. */
+function zaehlerVerbrauch(we, typ, von, bis){
+  let summe = 0, gefunden = false;
+  for (const z of (we.zaehler||[]).filter(z=>z.typ===typ)){
+    const abl = [...(z.ablesungen||[])].sort((a,b)=>a.datum.localeCompare(b.datum));
+    const start = [...abl].reverse().find(a=>a.datum<=von) || abl.find(a=>a.datum>=von && a.datum<=bis);
+    const ende  = [...abl].reverse().find(a=>a.datum<=bis);
+    if (start && ende && ende.datum>start.datum && ende.stand>=start.stand){
+      summe += ende.stand - start.stand; gefunden = true;
+    }
+  }
+  return gefunden ? summe : null;
+}
 /* ---- Fachlogik: Mietverhältnis & Soll/Ist ---- */
 function kaltmieteAm(mv, datumIso){
   let kalt = mv.kaltmieteCent||0;
@@ -695,6 +717,7 @@ function rObjektDetail(o){
       <div style="display:flex;gap:10px;align-items:center">
         <b>${esc(w.bezeichnung)}</b><span class="muted">${(w.wohnflaeche||0).toLocaleString("de-DE")} m² · ${w.zimmeranzahl||"?"} Zi.</span>
         <span class="sp" style="flex:1"></span>
+        <button class="klein" onclick="zaehlerDialog('${w.id}')">Zähler${(w.zaehler||[]).length?" ("+w.zaehler.length+")":""}</button>
         <button class="klein" onclick="weDialog('${o.id}','${w.id}')">Bearbeiten</button>
         <button class="klein" onclick="mvDialog('${w.id}')">+ Mietverhältnis</button>
         <button class="klein gefahr" onclick="weLoeschen('${w.id}')">Löschen</button></div>
@@ -772,6 +795,58 @@ function weLoeschen(id){
   if (Z.mietverhaeltnisse.some(m=>m.wohneinheitId===id)) return alert("Einheit hat Mietverhältnisse — bitte zuerst diese löschen.");
   if (!confirm("Wohneinheit löschen?")) return;
   Z.wohneinheiten = Z.wohneinheiten.filter(w=>w.id!==id); geaendert(); rendern();
+}
+
+function zaehlerDialog(weId){
+  const we = byId(Z.wohneinheiten,weId); if(!we) return;
+  const zs = we.zaehler||[];
+  modal("Zähler — "+we.bezeichnung, `
+    ${zs.length?`<table><tr><th>Typ</th><th>Nummer</th><th>Ablesungen</th><th>Letzter Stand</th><th></th></tr>
+    ${zs.map(z=>{
+      const letzte=[...(z.ablesungen||[])].sort((a,b)=>b.datum.localeCompare(a.datum))[0];
+      return `<tr><td>${esc(z.typ)}</td><td>${esc(z.zaehlernummer||"")}</td>
+      <td>${(z.ablesungen||[]).length}</td>
+      <td>${letzte?esc(String(letzte.stand).replace(".",","))+" ("+datumDE(letzte.datum)+")":"—"}</td>
+      <td style="white-space:nowrap"><button class="klein" onclick="ablesungDialog('${weId}','${z.id}')">+ Ablesung</button>
+      <button class="klein gefahr" onclick="zaehlerLoeschen('${weId}','${z.id}')">×</button></td></tr>`;
+    }).join("")}</table>`:'<p class="hinweis">Noch keine Zähler. Für die Verbrauchsverteilung (Heizung/Wasser) je Einheit Zähler anlegen und Anfangs-/Endstände erfassen.</p>'}
+    <h3>Neuer Zähler</h3>
+    ${auswahlFeld("z_typ","Typ",ZAEHLER_TYPEN.map(t=>[t,t]),"Heizung")}
+    ${feld("z_nr","Zählernummer (optional)")}`,
+    "Zähler anlegen", () => {
+      (we.zaehler ||= []).push({id:uid(), typ:F("z_typ"), zaehlernummer:F("z_nr")||null, ablesungen:[]});
+      geaendert();
+      setTimeout(()=>zaehlerDialog(weId),0);
+    });
+}
+function zaehlerLoeschen(weId, zId){
+  const we = byId(Z.wohneinheiten,weId); if(!we) return;
+  if (!confirm("Zähler samt Ablesungen löschen?")) return;
+  we.zaehler = (we.zaehler||[]).filter(z=>z.id!==zId);
+  geaendert(); document.getElementById("dlg").close(); zaehlerDialog(weId);
+}
+function ablesungDialog(weId, zId){
+  const we = byId(Z.wohneinheiten,weId); const z = byId(we?.zaehler||[],zId); if(!z) return;
+  document.getElementById("dlg").close();
+  const abl = [...(z.ablesungen||[])].sort((a,b)=>b.datum.localeCompare(a.datum));
+  modal(`Ablesung — ${z.typ}${z.zaehlernummer?" ("+z.zaehlernummer+")":""}`, `
+    ${abl.length?`<table><tr><th>Datum</th><th class="r">Stand</th><th></th></tr>
+    ${abl.map(a=>`<tr><td>${datumDE(a.datum)}</td><td class="r">${esc(String(a.stand).replace(".",","))}</td>
+    <td><button class="klein gefahr" onclick="ablesungLoeschen('${weId}','${zId}','${a.id}')">×</button></td></tr>`).join("")}</table>`:""}
+    <div class="zeile"><div>${feld("ab_datum","Datum",heute(),"date")}</div><div>${feld("ab_stand","Zählerstand")}</div></div>
+    <p class="hinweis">Für eine Abrechnungsperiode genügen Anfangs- und Endstand (z. B. 01.01. und 31.12.).</p>`,
+    "Ablesung speichern", () => {
+      const stand = parseFloat(String(F("ab_stand")).replace(/\./g,"").replace(",","."));
+      if (!F("ab_datum") || isNaN(stand)){ alert("Datum und Stand angeben."); return false; }
+      (z.ablesungen ||= []).push({id:uid(), datum:F("ab_datum"), stand});
+      geaendert();
+      setTimeout(()=>zaehlerDialog(weId),0);
+    });
+}
+function ablesungLoeschen(weId, zId, aId){
+  const z = byId(byId(Z.wohneinheiten,weId)?.zaehler||[],zId); if(!z) return;
+  z.ablesungen = (z.ablesungen||[]).filter(a=>a.id!==aId);
+  geaendert(); document.getElementById("dlg").close(); ablesungDialog(weId,zId);
 }
 function mvDialog(weId, id){
   const m = byId(Z.mietverhaeltnisse,id) || {personenzahl:1};
@@ -1178,17 +1253,21 @@ function nkDetail(a){
     ${a.positionen.map(p=>`<tr><td>${esc(p.bezeichnung)}${p.betrKvNummer?` <span class="muted">(BetrKV ${p.betrKvNummer})</span>`:""}</td>
       <td class="r">${euro(p.gesamtbetragCent)}</td>
       <td><select onchange="nkPosVs('${a.id}','${p.id}',this.value)" ${a.status!=="Entwurf"?"disabled":""}>
-        ${VERTEILER.map(([v,t])=>`<option value="${v}" ${p.verteilerschluessel===v?"selected":""}>${t}</option>`).join("")}</select></td></tr>`).join("")}</table>
-    <p class="hinweis">* Verbrauch wird ohne Zählerstände wie Wohnfläche verteilt (§ 9a HeizkostenV-Vereinfachung dieser Version).</p>`}
+        ${VERTEILER.map(([v,t])=>`<option value="${v}" ${p.verteilerschluessel===v?"selected":""}>${t}</option>`).join("")}</select>
+        ${p.verteilerschluessel==="Verbrauch"?`<select style="margin-top:3px" onchange="nkPosGrund('${a.id}','${p.id}',this.value)" ${a.status!=="Entwurf"?"disabled":""}>
+          ${[30,40,50].map(g=>`<option value="${g}" ${(p.grundanteilProzent??30)===g?"selected":""}>${g} % Grundkosten / ${100-g} % Verbrauch</option>`).join("")}</select>`:""}</td></tr>`).join("")}</table>
+    <p class="hinweis">Verbrauch nutzt die Zählerstände der Wohneinheiten (Objekte → Zähler); fehlen Stände, wird ersatzweise nach Wohnfläche verteilt.</p>`}
     <div class="werkzeuge" style="margin-top:10px">
-      <button class="primaer" onclick="nkVerteilen('${a.id}')">Verteilung berechnen</button>
+      ${a.status==="Entwurf"?`<button class="primaer" onclick="nkVerteilen('${a.id}')">Verteilung berechnen</button>`:""}
       ${a.mieterAbrechnungen?.length?`<button onclick="nkDrucken('${a.id}')">🖨 Abrechnungen drucken (PDF)</button>`:""}
+      ${a.status==="Entwurf"&&a.mieterAbrechnungen?.length?`<button onclick="nkAbschliessen('${a.id}')">Salden verbuchen &amp; abschließen</button>`:""}
     </div>
     ${a.mieterAbrechnungen?.length?`<h3>Mieter-Abrechnungen</h3>
-    <table><tr><th>Einheit</th><th>Mieter</th><th class="r">Kostenanteil</th><th class="r">Vorauszahlungen</th><th class="r">Saldo</th></tr>
+    <table><tr><th>Einheit</th><th>Mieter</th><th>Nutzungszeitraum</th><th class="r">Kostenanteil</th><th class="r">Vorauszahlungen</th><th class="r">Saldo</th></tr>
     ${a.mieterAbrechnungen.map(m=>{
       const anteil = m.anteile.reduce((x,t)=>x+t.anteilCent,0);
-      return `<tr><td>${esc(weName(m.wohneinheitId))}</td><td>${esc(m.mieterName)}</td>
+      return `<tr><td>${esc(weName(m.wohneinheitId))}</td><td>${esc(m.mieterName)}${m.verbrauchFehlt?' <span class="gelb" title="Zählerstände unvollständig — Verbrauchspositionen nach Fläche verteilt">⚠</span>':""}</td>
+      <td>${m.nutzungVon?datumDE(m.nutzungVon)+" – "+datumDE(m.nutzungBis):"—"}</td>
       <td class="r">${euro(anteil)}</td><td class="r">${euro(m.vorauszahlungenCent)}</td>
       <td class="r">${m.saldoCent>=0?`<span class="gruen">${euro(m.saldoCent)} Guthaben</span>`:`<span class="rot">${euro(-m.saldoCent)} Nachzahlung</span>`}</td></tr>`;
     }).join("")}</table>`:""}
@@ -1223,6 +1302,10 @@ function nkPosVs(abrId, posId, wert){
   const p = byId(byId(Z.nkAbrechnungen,abrId)?.positionen||[],posId);
   if (p){ p.verteilerschluessel = wert; geaendert(); }
 }
+function nkPosGrund(abrId, posId, wert){
+  const p = byId(byId(Z.nkAbrechnungen,abrId)?.positionen||[],posId);
+  if (p){ p.grundanteilProzent = +wert; geaendert(); }
+}
 function nkLoeschen(id){
   if (!confirm("Abrechnung löschen?")) return;
   Z.nkAbrechnungen = Z.nkAbrechnungen.filter(a=>a.id!==id);
@@ -1239,38 +1322,93 @@ function nkVerteilen(abrId){
   const a = byId(Z.nkAbrechnungen,abrId); if(!a) return;
   const wes = Z.wohneinheiten.filter(w=>w.objektId===a.objektId);
   const gesamtFlaeche = wes.reduce((x,w)=>x+(w.wohnflaeche||0),0);
-  // aktive MVs je Einheit + Personensumme
-  const aktiveMv = {};
+  const tageGesamt = (new Date(a.zeitraumBis)-new Date(a.zeitraumVon))/864e5 + 1;
+
+  // Nutzungs-Segmente: je Mietverhältnis, das den Zeitraum überlappt (Mieterwechsel-Splitting)
+  const segmente = [];
   for (const we of wes){
-    const mv = Z.mietverhaeltnisse.filter(m=>m.wohneinheitId===we.id && mvAktivAm(m,a.zeitraumVon,a.zeitraumBis))
-      .sort((x,y)=>(y.mietbeginn||"").localeCompare(x.mietbeginn||""))[0];
-    if (mv) aktiveMv[we.id]=mv;
+    for (const mv of Z.mietverhaeltnisse.filter(m=>m.wohneinheitId===we.id && mvAktivAm(m,a.zeitraumVon,a.zeitraumBis))){
+      const von = mv.mietbeginn > a.zeitraumVon ? mv.mietbeginn : a.zeitraumVon;
+      const bis = (mv.mietende && mv.mietende < a.zeitraumBis) ? mv.mietende : a.zeitraumBis;
+      const tage = (new Date(bis)-new Date(von))/864e5 + 1;
+      if (tage<=0) continue;
+      segmente.push({we, mv, von, bis, zeitanteil: tage/tageGesamt});
+    }
   }
-  const personenSumme = Object.values(aktiveMv).reduce((x,m)=>x+(m.personenzahl||1),0);
+  const personenGewichtet = segmente.reduce((x,s)=>x+(s.mv.personenzahl||1)*s.zeitanteil,0);
+  const segmenteJeWe = {};
+  for (const s of segmente) segmenteJeWe[s.we.id] = (segmenteJeWe[s.we.id]||0)+1;
+
+  // Verbrauch je WE und Zählertyp (über den gesamten Abrechnungszeitraum)
+  const verbrauchCache = {};
+  const verbrauchWE = (we,typ) => {
+    const k = we.id+"|"+typ;
+    if (!(k in verbrauchCache)) verbrauchCache[k] = zaehlerVerbrauch(we, typ, a.zeitraumVon, a.zeitraumBis);
+    return verbrauchCache[k];
+  };
+
   a.mieterAbrechnungen = [];
-  for (const we of wes){
-    const mv = aktiveMv[we.id]; if(!mv) continue;
-    // Vorauszahlungen: explizit gebuchte VZ (nkvz/hzvz) haben Vorrang, sonst vertraglich × aktive Monate
-    const gebuchteVz = Z.buchungen.filter(b=>b.objektId===a.objektId && b.wohneinheitId===we.id && !b.istSoll
-      && b.datum>=a.zeitraumVon && b.datum<=a.zeitraumBis && (b.kostenartId==="nkvz"||b.kostenartId==="hzvz"))
-      .reduce((x,b)=>x+b.betragCent,0);
-    const vertraglich = ((mv.nkVorauszahlungCent||0)+(mv.heizkostenVorauszahlungCent||0)) * monateAktiv(mv,a.zeitraumVon,a.zeitraumBis);
-    const vz = gebuchteVz>0 ? gebuchteVz : vertraglich;
+  for (const seg of segmente){
+    const {we, mv, von, bis, zeitanteil} = seg;
+    // Vorauszahlungen: explizit gebuchte VZ nur, wenn die WE genau ein Segment hat (sonst nicht zuordenbar)
+    let vz = ((mv.nkVorauszahlungCent||0)+(mv.heizkostenVorauszahlungCent||0)) * monateAktiv(mv, a.zeitraumVon, a.zeitraumBis);
+    if (segmenteJeWe[we.id]===1){
+      const gebucht = Z.buchungen.filter(b=>b.objektId===a.objektId && b.wohneinheitId===we.id && !b.istSoll
+        && b.datum>=a.zeitraumVon && b.datum<=a.zeitraumBis && (b.kostenartId==="nkvz"||b.kostenartId==="hzvz"))
+        .reduce((x,b)=>x+b.betragCent,0);
+      if (gebucht>0) vz = gebucht;
+    }
+    let verbrauchFehlt = false;
+    const flaechenFaktor = gesamtFlaeche>0 ? (we.wohnflaeche||0)/gesamtFlaeche : 0;
     const anteile = a.positionen.map(p=>{
       let faktor;
-      switch(p.verteilerschluessel){
-        case "Personenzahl": faktor = personenSumme>0 ? (mv.personenzahl||1)/personenSumme : 0; break;
-        case "Wohneinheiten": faktor = Object.keys(aktiveMv).length>0 ? 1/wes.length : 0; break;
-        case "Direktzuordnung": faktor = 1; break;
-        default: faktor = gesamtFlaeche>0 ? (we.wohnflaeche||0)/gesamtFlaeche : 0;
+      switch (p.verteilerschluessel){
+        case "Personenzahl":
+          faktor = personenGewichtet>0 ? ((mv.personenzahl||1)*zeitanteil)/personenGewichtet : 0; break;
+        case "Wohneinheiten":
+          faktor = wes.length>0 ? (1/wes.length)*zeitanteil : 0; break;
+        case "Direktzuordnung":
+          faktor = zeitanteil; break;
+        case "Verbrauch": {
+          const typ = zaehlerTypFuerKostenart(p.betrKvNummer);
+          const eigen = typ ? verbrauchWE(we,typ) : null;
+          let summe = 0, alleDa = eigen!=null;
+          if (typ) for (const w2 of wes){ const v=verbrauchWE(w2,typ); if(v==null){alleDa=false;} else summe+=v; }
+          if (typ && alleDa && summe>0){
+            const grund = (p.grundanteilProzent ?? 30)/100;   // HeizkostenV: 30 % Grundkosten nach Fläche, 70 % Verbrauch
+            faktor = grund*flaechenFaktor*zeitanteil + (1-grund)*(eigen/summe)*zeitanteil;
+          } else {
+            faktor = flaechenFaktor*zeitanteil;               // Rückfall ohne vollständige Zählerdaten
+            verbrauchFehlt = true;
+          }
+          break;
+        }
+        default:
+          faktor = flaechenFaktor*zeitanteil;
       }
       return {id:uid(), nkPositionId:p.id, bezeichnung:p.bezeichnung, gesamtkostenCent:p.gesamtbetragCent,
         anteilCent:Math.round(p.gesamtbetragCent*faktor), anteilsfaktor:faktor};
     });
     const gesamtanteil = anteile.reduce((x,t)=>x+t.anteilCent,0);
     a.mieterAbrechnungen.push({id:uid(), wohneinheitId:we.id, mieterId:mv.mieterId,
-      mieterName:kontaktName(mv.mieterId), anteile, vorauszahlungenCent:vz, saldoCent:vz-gesamtanteil});
+      mieterName:kontaktName(mv.mieterId), nutzungVon:von, nutzungBis:bis,
+      anteile, vorauszahlungenCent:vz, saldoCent:vz-gesamtanteil, verbrauchFehlt});
   }
+  geaendert(); rendern();
+}
+function nkAbschliessen(abrId){
+  const a = byId(Z.nkAbrechnungen,abrId);
+  if (!a || a.status!=="Entwurf" || !a.mieterAbrechnungen?.length) return;
+  if (!confirm("Salden als Buchungen anlegen und Abrechnung abschließen? Danach ist sie nicht mehr änderbar.")) return;
+  const jahr = a.zeitraumVon.slice(0,4);
+  for (const m of a.mieterAbrechnungen){
+    if (!m.saldoCent) continue;
+    Z.buchungen.push({id:uid(), datum:heute(), objektId:a.objektId, wohneinheitId:m.wohneinheitId,
+      kostenartId:"nkvz", betragCent:-m.saldoCent,
+      bezeichnung:`NK-Abrechnung ${jahr}: ${m.saldoCent>0?"Guthaben-Auszahlung":"Nachzahlung"} ${m.mieterName}`,
+      kontaktId:m.mieterId||null, quelle:"Nebenkosten", istSoll:false, istAusgleichVonId:null});
+  }
+  a.status = "Abgeschlossen";
   geaendert(); rendern();
 }
 function nkDrucken(abrId){
@@ -1283,7 +1421,8 @@ function nkDrucken(abrId){
     <p><b>Objekt:</b> ${esc(obj?.bezeichnung||"")}, ${esc(adresseText(obj?.adresse))}<br>
     <b>Wohneinheit:</b> ${esc(weName(m.wohneinheitId))}<br>
     <b>Mieter:</b> ${esc(m.mieterName)}<br>
-    <b>Abrechnungszeitraum:</b> ${datumDE(a.zeitraumVon)} bis ${datumDE(a.zeitraumBis)}</p>
+    <b>Abrechnungszeitraum:</b> ${datumDE(a.zeitraumVon)} bis ${datumDE(a.zeitraumBis)}<br>
+    <b>Ihr Nutzungszeitraum:</b> ${m.nutzungVon?datumDE(m.nutzungVon)+" bis "+datumDE(m.nutzungBis):datumDE(a.zeitraumVon)+" bis "+datumDE(a.zeitraumBis)}</p>
     <table><tr><th>Kostenart</th><th style="text-align:right">Gesamtkosten</th><th style="text-align:right">Ihr Anteil</th><th style="text-align:right">Betrag</th></tr>
     ${m.anteile.map(t=>`<tr><td>${esc(t.bezeichnung)}</td><td style="text-align:right">${euro(t.gesamtkostenCent)}</td>
       <td style="text-align:right">${(t.anteilsfaktor*100).toLocaleString("de-DE",{maximumFractionDigits:2})} %</td>
