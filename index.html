@@ -172,7 +172,7 @@ async function dateiNeu(){
   try{
     dateiHandle = await showSaveFilePicker({suggestedName:"immotool-daten.json",
       types:[{description:"ImmoTool-Daten",accept:{"application/json":[".json"]}}]});
-    Z = neuerZustand(); await speichern(); rendern();
+    Z = neuerZustand(); await speichern(); handleMerken(); rendern();
   }catch(e){ if(e.name!=="AbortError") alert("Fehler: "+e.message); }
 }
 async function dateiOeffnen(){
@@ -180,6 +180,7 @@ async function dateiOeffnen(){
   try{
     const [h] = await showOpenFilePicker({types:[{description:"ImmoTool-Daten",accept:{"application/json":[".json"]}}]});
     dateiHandle = h;
+    handleMerken();
     const f = await h.getFile();
     ladeJson(await f.text());
   }catch(e){ if(e.name!=="AbortError") alert("Fehler beim Öffnen: "+e.message); }
@@ -262,6 +263,34 @@ async function idbLaden(){
   });
 }
 const hatDateiApi = !!window.showSaveFilePicker;
+/* ---- Datei-Handle merken (PC): beim Start wieder verbinden ---- */
+let gemerkterHandle = null;
+async function handleMerken(){
+  if (!_idb) _idb = await idbOeffnen();
+  if (!_idb || !dateiHandle) return;
+  try{ _idb.transaction("daten","readwrite").objectStore("daten").put(dateiHandle, "handle"); }catch(e){}
+}
+async function handleLaden(){
+  if (!_idb) _idb = await idbOeffnen();
+  if (!_idb) return null;
+  return new Promise(res => {
+    try{
+      const rq = _idb.transaction("daten").objectStore("daten").get("handle");
+      rq.onsuccess = () => res(rq.result||null);
+      rq.onerror = () => res(null);
+    }catch(e){ res(null); }
+  });
+}
+async function gemerkteVerbinden(){
+  if (!gemerkterHandle) return;
+  try{
+    if (await gemerkterHandle.requestPermission({mode:"readwrite"}) !== "granted") return;
+    dateiHandle = gemerkterHandle; gemerkterHandle = null;
+    const f = await dateiHandle.getFile();
+    ladeJson(await f.text());
+  }catch(e){ alert("Datei konnte nicht verbunden werden: "+e.message); }
+}
+
 async function teilenOderHerunterladen(){
   const blob = new Blob([JSON.stringify(Z,null,1)], {type:"application/json"});
   const datei = new File([blob], "immotool-daten.json", {type:"application/json"});
@@ -303,7 +332,14 @@ const VERTEILER = [["Wohnflaeche","Wohnfläche"],["Personenzahl","Personenzahl"]
 const verteilerName = v => (VERTEILER.find(x=>x[0]===v)||["","?"])[1];
 
 /* ---- Fachlogik: Mietverhältnis & Soll/Ist ---- */
-const warmmiete = mv => (mv.kaltmieteCent||0)+(mv.nkVorauszahlungCent||0)+(mv.heizkostenVorauszahlungCent||0);
+function kaltmieteAm(mv, datumIso){
+  let kalt = mv.kaltmieteCent||0;
+  for (const e of [...(mv.mieterhoehungen||[])].sort((a,b)=>a.gueltigAb.localeCompare(b.gueltigAb)))
+    if (e.gueltigAb <= datumIso) kalt = e.neueKaltmieteCent;
+  return kalt;
+}
+const warmmieteAm = (mv, datumIso) => kaltmieteAm(mv, datumIso)+(mv.nkVorauszahlungCent||0)+(mv.heizkostenVorauszahlungCent||0);
+const warmmiete = mv => warmmieteAm(mv, heute());
 const mvAktivAm = (mv, isoVon, isoBis) => mv.mietbeginn <= isoBis && (!mv.mietende || mv.mietende >= isoVon);
 
 function sollErzeugen(jahr, monat){
@@ -315,7 +351,7 @@ function sollErzeugen(jahr, monat){
     if (!mvAktivAm(mv, von, bis)) continue;
     if (vorhandene.has(mv.id)) { schonDa++; continue; }
     const we = byId(Z.wohneinheiten, mv.wohneinheitId); if(!we) continue;
-    const betrag = warmmiete(mv); if(!betrag) continue;
+    const betrag = warmmieteAm(mv, von); if(!betrag) continue;
     Z.buchungen.push({id:uid(), datum:von, objektId:we.objektId, wohneinheitId:we.id,
       kostenartId:"miete", betragCent:betrag,
       bezeichnung:`Soll Miete ${jahr}-${String(monat).padStart(2,"0")} – ${we.bezeichnung}`,
@@ -408,7 +444,11 @@ function rendern(){
   const R = {dashboard:rDashboard, objekte:rObjekte, kontakte:rKontakte, dokumente:rDokumente,
     inbox:rInbox, buchungen:rBuchungen, belegimport:rBelegimport, weg:rWeg,
     nebenkosten:rNebenkosten, rendite:rRendite, bilanz:rBilanz, daten:rDaten};
-  document.getElementById("inhalt").innerHTML = (R[seite]||rDashboard)();
+  const banner = (gemerkterHandle && !dateiHandle) ?
+    `<div class="karte" style="border-color:var(--akzent);display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+      <span>📄 Zuletzt verwendete Datendatei <b>${esc(gemerkterHandle.name)}</b> wieder verbinden?</span>
+      <button class="primaer" onclick="gemerkteVerbinden()">Verbinden &amp; laden</button></div>` : "";
+  document.getElementById("inhalt").innerHTML = banner + (R[seite]||rDashboard)();
   tabellenAnnotieren(document.getElementById("inhalt"));
   (window["nach_"+seite]||(()=>{}))();
 }
@@ -662,10 +702,11 @@ function rObjektDetail(o){
       ${mvs.map(m=>`<tr ${m.mietende&&m.mietende<heute()?'class="muted"':''}>
         <td>${esc(kontaktName(m.mieterId))}</td>
         <td>${datumDE(m.mietbeginn)} – ${m.mietende?datumDE(m.mietende):"offen"}</td>
-        <td class="r">${euro(m.kaltmieteCent||0)}</td><td class="r">${euro(m.nkVorauszahlungCent||0)}</td>
+        <td class="r">${euro(kaltmieteAm(m,heute()))}${(m.mieterhoehungen||[]).length?' <span class="chip" title="Mieterhöhungen erfasst">↑'+m.mieterhoehungen.length+'</span>':''}</td><td class="r">${euro(m.nkVorauszahlungCent||0)}</td>
         <td class="r">${euro(m.heizkostenVorauszahlungCent||0)}</td><td class="r"><b>${euro(warmmiete(m))}</b></td>
         <td class="r">${m.personenzahl||1}</td>
-        <td style="white-space:nowrap"><button class="klein" onclick="mvDialog('${w.id}','${m.id}')">Bearb.</button>
+        <td style="white-space:nowrap"><button class="klein" onclick="mietErhDialog('${m.id}')">Miete ↑</button>
+        <button class="klein" onclick="mvDialog('${w.id}','${m.id}')">Bearb.</button>
         <button class="klein gefahr" onclick="mvLoeschen('${m.id}')">Lösch.</button></td></tr>`).join("")}</table>`:'<div class="hinweis">Kein Mietverhältnis.</div>'}
     </div>`;}).join("")}
   </div>`;
@@ -752,6 +793,34 @@ function mvDialog(weId, id){
       if (!id) Z.mietverhaeltnisse.push(ziel);
       geaendert();
     });
+}
+
+function mietErhDialog(mvId){
+  const mv = byId(Z.mietverhaeltnisse,mvId); if(!mv) return;
+  const liste = [...(mv.mieterhoehungen||[])].sort((a,b)=>a.gueltigAb.localeCompare(b.gueltigAb));
+  modal("Mieterhöhungen — "+kontaktName(mv.mieterId), `
+    <p class="hinweis">Ausgangs-Kaltmiete: ${euro(mv.kaltmieteCent||0)} ab ${datumDE(mv.mietbeginn)} · aktuell gültig: <b>${euro(kaltmieteAm(mv,heute()))}</b></p>
+    ${liste.length?`<table><tr><th>Gültig ab</th><th class="r">Neue Kaltmiete</th><th>Grund</th><th></th></tr>
+      ${liste.map(e=>`<tr><td>${datumDE(e.gueltigAb)}</td><td class="r">${euro(e.neueKaltmieteCent)}</td><td>${esc(e.grund||"")}</td>
+      <td><button class="klein gefahr" onclick="mietErhLoeschen('${mvId}','${e.id}')">×</button></td></tr>`).join("")}</table>`
+      :'<p class="hinweis">Noch keine Erhöhung erfasst.</p>'}
+    <h3>Neue Erhöhung</h3>
+    <div class="zeile"><div>${feld("me_ab","Gültig ab *","","date")}</div><div>${feldG("me_kalt","Neue Kaltmiete *",null)}</div></div>
+    ${feld("me_grund","Grund (z. B. Anpassung §558 BGB, Indexmiete)")}
+    <p class="hinweis">Die Soll-Stellung nutzt automatisch je Monat den dann gültigen Betrag. Bereits erzeugte Soll-Buchungen bleiben unverändert.</p>`,
+    "Erhöhung speichern", () => {
+      const ab = F("me_ab"), kalt = parseEuro(F("me_kalt"));
+      if (!ab || kalt==null){ alert("Datum und neue Kaltmiete angeben."); return false; }
+      (mv.mieterhoehungen ||= []).push({id:uid(), gueltigAb:ab, neueKaltmieteCent:Math.abs(kalt), grund:F("me_grund")||null});
+      geaendert();
+    });
+}
+function mietErhLoeschen(mvId, eId){
+  const mv = byId(Z.mietverhaeltnisse,mvId); if(!mv) return;
+  mv.mieterhoehungen = (mv.mieterhoehungen||[]).filter(e=>e.id!==eId);
+  geaendert();
+  document.getElementById("dlg").close();
+  mietErhDialog(mvId);
 }
 function mvLoeschen(id){
   if (!confirm("Mietverhältnis löschen?")) return;
@@ -1468,6 +1537,19 @@ try{ const t = localStorage.getItem("immotool-theme"); if(t) document.documentEl
   if (!hatDateiApi){
     const gespeichert = await idbLaden();
     if (gespeichert){ try{ Z = Object.assign(neuerZustand(), JSON.parse(gespeichert)); }catch(e){} }
+  } else {
+    const h = await handleLaden();
+    if (h){
+      try{
+        if (await h.queryPermission({mode:"readwrite"}) === "granted"){
+          dateiHandle = h;
+          const f = await h.getFile();
+          Z = Object.assign(neuerZustand(), JSON.parse(await f.text()));
+        } else {
+          gemerkterHandle = h;
+        }
+      }catch(e){ gemerkterHandle = null; }
+    }
   }
   rendern();
 })();
