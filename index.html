@@ -201,6 +201,7 @@ function ladeJson(text){
     if (!d.meta || !Array.isArray(d.objekte)) throw new Error("Keine ImmoTool-Datendatei.");
     Z = zustandMigrieren(Object.assign(neuerZustand(), d));
     if (!hatDateiApi){ dirty=true; idbSpeichern(); } else { dirty=false; }
+    if (!_restoreLauf){ letzterSnapshot = Date.now(); snapshotSichern(); }
     statusZeigen(); rendern();
   }catch(e){ alert("Datei konnte nicht gelesen werden: "+e.message); }
 }
@@ -216,6 +217,7 @@ async function speichern(){
 }
 function geaendert(){
   dirty = true; statusZeigen();
+  if (Date.now()-letzterSnapshot > 21600e3){ letzterSnapshot = Date.now(); snapshotSichern(); }
   clearTimeout(speicherTimer);
   speicherTimer = setTimeout(()=>{ dateiHandle ? speichern() : idbSpeichern(); }, 800);
 }
@@ -259,12 +261,12 @@ async function idbSpeichern(){
     dirty = false; statusZeigen();
   }catch(e){}
 }
-async function idbLaden(){
+async function idbLaden(key="zustand"){
   if (!_idb) _idb = await idbOeffnen();
   if (!_idb) return null;
   return new Promise(res => {
     try{
-      const rq = _idb.transaction("daten").objectStore("daten").get("zustand");
+      const rq = _idb.transaction("daten").objectStore("daten").get(key);
       rq.onsuccess = () => res(rq.result || null);
       rq.onerror = () => res(null);
     }catch(e){ res(null); }
@@ -299,6 +301,41 @@ async function gemerkteVerbinden(){
   }catch(e){ alert("Datei konnte nicht verbunden werden: "+e.message); }
 }
 
+/* ---- Automatische Schnappschüsse (IndexedDB): beim Laden + alle 6 h bei Änderungen, letzte 5 ---- */
+let letzterSnapshot = 0, _restoreLauf = false;
+async function snapshotSichern(){
+  if (!_idb) _idb = await idbOeffnen();
+  if (!_idb) return;
+  try{
+    const store = _idb.transaction("daten","readwrite").objectStore("daten");
+    store.put(JSON.stringify(Z), "snap:"+new Date().toISOString());
+    const rq = store.getAllKeys();
+    rq.onsuccess = () => {
+      const snaps = rq.result.map(String).filter(k=>k.startsWith("snap:")).sort();
+      for (const alt of snaps.slice(0,-5)){ try{ store.delete(alt); }catch(e){} }
+    };
+  }catch(e){}
+}
+async function snapshotKeys(){
+  if (!_idb) _idb = await idbOeffnen();
+  if (!_idb) return [];
+  return new Promise(res => {
+    try{
+      const rq = _idb.transaction("daten").objectStore("daten").getAllKeys();
+      rq.onsuccess = () => res(rq.result.map(String).filter(k=>k.startsWith("snap:")));
+      rq.onerror = () => res([]);
+    }catch(e){ res([]); }
+  });
+}
+async function snapshotWiederherstellen(key){
+  if (!confirm("Diesen Schnappschuss wiederherstellen? Der aktuelle Stand wird ersetzt und beim nächsten Speichern in die Datendatei übernommen.")) return;
+  const json = await idbLaden(key);
+  if (!json) return alert("Schnappschuss nicht gefunden.");
+  _restoreLauf = true;
+  ladeJson(json);
+  _restoreLauf = false;
+  geaendert();
+}
 async function teilenOderHerunterladen(){
   const blob = new Blob([JSON.stringify(Z,null,1)], {type:"application/json"});
   const datei = new File([blob], "immotool-daten.json", {type:"application/json"});
@@ -334,6 +371,28 @@ function kontaktName(id){
   return k.firmenname?.trim() ? k.firmenname : [k.vorname,k.nachname].filter(Boolean).join(" ");
 }
 const adresseText = a => !a ? "" : [ [a.strasse,a.hausnummer].filter(Boolean).join(" "), [a.plz,a.ort].filter(Boolean).join(" ") ].filter(Boolean).join(", ");
+/* PLZ → Ort (openplzapi.org, Fallback zippopotam.us). Füllt nur leere Ortsfelder; merkt das Bundesland
+   für die automatische Grunderwerbsteuer-Vorbelegung. Ohne Internet passiert einfach nichts. */
+let _plzInfo = null;
+async function ortZuPlz(plz, ortFeldId){
+  if (!/^\d{5}$/.test(plz)) return;
+  const feld = document.getElementById(ortFeldId);
+  if (!feld || feld.value.trim()) return;
+  let ort = null, land = null;
+  try{
+    const r = await fetch("https://openplzapi.org/de/Localities?postalCode="+plz);
+    if (r.ok){ const d = await r.json(); ort = d?.[0]?.name || null; land = d?.[0]?.federalState?.name || null; }
+  }catch(e){}
+  if (!ort){
+    try{
+      const r = await fetch("https://api.zippopotam.us/de/"+plz);
+      if (r.ok){ const d = await r.json(); ort = d?.places?.[0]?.["place name"] || null; land = d?.places?.[0]?.state || null; }
+    }catch(e){}
+  }
+  if (ort && !feld.value.trim()){ feld.value = ort; _plzInfo = {plz, ort, land}; }
+}
+const plzListener = (plzId, ortId) => document.getElementById(plzId)?.addEventListener("input",
+  ev => { const v = ev.target.value.trim(); if (v.length===5) ortZuPlz(v, ortId); });
 const KONTAKT_TYPEN = ["Mieter","Versorger","Handwerker","Versicherer","WEG-Verwalter","Sonstige"];
 const OBJEKT_TYPEN = ["Mehrfamilienhaus","Einfamilienhaus","Eigentumswohnung"];
 const VERTEILER = [["Wohnflaeche","Wohnfläche"],["Personenzahl","Personenzahl"],["Wohneinheiten","Wohneinheiten"],["Verbrauch","Verbrauch (Zähler)"],["Direktzuordnung","Direktzuordnung"]];
@@ -365,13 +424,20 @@ function zaehlerVerbrauch(we, typ, von, bis){
 function kaltmieteAm(mv, datumIso){
   let kalt = mv.kaltmieteCent||0;
   for (const e of [...(mv.mieterhoehungen||[])].sort((a,b)=>a.gueltigAb.localeCompare(b.gueltigAb)))
-    if (e.gueltigAb <= datumIso) kalt = e.neueKaltmieteCent;
+    if (e.gueltigAb <= datumIso && e.neueKaltmieteCent!=null) kalt = e.neueKaltmieteCent;
   return kalt;
+}
+/* Garagen-/Stellplatzmiete zum Stichtag (Historie über mieterhoehungen-Einträge mit neueGaragenmieteCent) */
+function garagenmieteAm(mv, datumIso){
+  let g = mv.garagenmieteCent||0;
+  for (const e of [...(mv.mieterhoehungen||[])].sort((a,b)=>a.gueltigAb.localeCompare(b.gueltigAb)))
+    if (e.gueltigAb <= datumIso && e.neueGaragenmieteCent!=null) g = e.neueGaragenmieteCent;
+  return g;
 }
 const warmmieteAm = (mv, datumIso) => kaltmieteAm(mv, datumIso)+(mv.nkVorauszahlungCent||0)+(mv.heizkostenVorauszahlungCent||0);
 const warmmiete = mv => warmmieteAm(mv, heute());
 /* Gesamtmiete = Warmmiete + Garagen-/Stellplatzmiete (steuerlich getrennt verbucht) */
-const gesamtmieteAm = (mv, datumIso) => warmmieteAm(mv, datumIso)+(mv.garagenmieteCent||0);
+const gesamtmieteAm = (mv, datumIso) => warmmieteAm(mv, datumIso)+garagenmieteAm(mv, datumIso);
 const gesamtmiete = mv => gesamtmieteAm(mv, heute());
 const mvAktivAm = (mv, isoVon, isoBis) => mv.mietbeginn <= isoBis && (!mv.mietende || mv.mietende >= isoVon);
 
@@ -387,7 +453,8 @@ function sollErzeugen(jahr, monat){
     const betrag = gesamtmieteAm(mv, von); if(!betrag) continue;
     Z.buchungen.push({id:uid(), datum:von, objektId:we.objektId, wohneinheitId:we.id,
       kostenartId:"miete", betragCent:betrag,
-      garagenAnteilCent:Math.min(mv.garagenmieteCent||0, betrag),
+      garagenAnteilCent:Math.min(garagenmieteAm(mv, von), betrag),
+      nkVzAnteilCent:mv.nkVorauszahlungCent||0, hzVzAnteilCent:mv.heizkostenVorauszahlungCent||0,
       bezeichnung:`Soll Miete ${jahr}-${String(monat).padStart(2,"0")} – ${we.bezeichnung}`,
       quelle:"SollStellung", quellenReferenzId:mv.id, kontaktId:mv.mieterId, istSoll:true, istAusgleichVonId:null});
     erzeugt++;
@@ -403,34 +470,52 @@ function mietStatus(jahr, monat){
     return {sollBuchung:s, sollCent:s.betragCent, istCent:ist, offenCent:s.betragCent-ist, bezahlt:ist>=s.betragCent};
   }).sort((a,b)=> objektName(a.sollBuchung.objektId).localeCompare(objektName(b.sollBuchung.objektId)) || weName(a.sollBuchung.wohneinheitId).localeCompare(weName(b.sollBuchung.wohneinheitId)));
 }
-function eingangBestaetigen(sollId, betragCent){
+function eingangBestaetigen(sollId, betragCent, datumIso){
   const s = byId(Z.buchungen, sollId); if(!s||!s.istSoll) return;
   const istBuchungen = Z.buchungen.filter(b=>b.istAusgleichVonId===sollId&&!b.istSoll);
   const bereits = istBuchungen.reduce((a,b)=>a+b.betragCent,0);
   const offen = (betragCent ?? (s.betragCent-bereits));
   if (offen<=0) return;
-  /* Garagen-/Stellplatzanteil (Snapshot aus der Soll-Buchung) steuerlich getrennt verbuchen.
-     Teilzahlungen werden anteilig gesplittet; die kumulierte Zielgröße verhindert Rundungsdrift. */
-  const garageSoll = Math.min(s.garagenAnteilCent||0, s.betragCent);
-  let garageTeil = 0;
-  if (garageSoll>0 && s.betragCent>0){
-    const bereitsGarage = istBuchungen.filter(b=>b.kostenartId==="garage").reduce((a,b)=>a+b.betragCent,0);
-    const zielGarage = Math.round(Math.min(bereits+offen, s.betragCent)*garageSoll/s.betragCent);
-    garageTeil = Math.max(0, Math.min(offen, zielGarage-bereitsGarage));
-  }
-  const neu = (kaId, betrag, bez) => Z.buchungen.push({id:uid(), datum:heute(), objektId:s.objektId, wohneinheitId:s.wohneinheitId,
-    kostenartId:kaId, betragCent:betrag, bezeichnung:bez,
+  const datum = datumIso || heute();   // Zuflussprinzip (§11 EStG): echtes Zahldatum verwenden
+  /* Anteile (Snapshots aus der Soll-Buchung) steuerlich getrennt verbuchen: Garage, NK-VZ, Heiz-VZ, Rest = Kaltmiete.
+     Teilzahlungen werden anteilig gesplittet; kumulierte Zielgrößen verhindern Rundungsdrift. */
+  const anteile = [["garage", s.garagenAnteilCent||0, "Garagen-/Stellplatzmiete (Ist) zu "],
+                   ["nkvz", s.nkVzAnteilCent||0, "NK-Vorauszahlung (Ist) zu "],
+                   ["hzvz", s.hzVzAnteilCent||0, "Heizkosten-VZ (Ist) zu "]];
+  const neu = (kaId, betrag, bez) => Z.buchungen.push({id:uid(), datum, objektId:s.objektId, wohneinheitId:s.wohneinheitId,
+    kostenartId:kaId, betragCent:betrag, bezeichnung:bez+s.bezeichnung,
     quelle:"SollStellung", quellenReferenzId:s.quellenReferenzId, kontaktId:s.kontaktId, istSoll:false, istAusgleichVonId:s.id});
-  if (offen-garageTeil>0) neu(s.kostenartId, offen-garageTeil, "Mieteingang (Ist) zu "+s.bezeichnung);
-  if (garageTeil>0) neu("garage", garageTeil, "Garagen-/Stellplatzmiete (Ist) zu "+s.bezeichnung);
+  let rest = offen;
+  if (s.betragCent>0) for (const [kaId, anteilSoll, bezPrefix] of anteile){
+    if (anteilSoll<=0 || rest<=0) continue;
+    const schon = istBuchungen.filter(b=>b.kostenartId===kaId).reduce((a,b)=>a+b.betragCent,0);
+    const ziel = Math.round(Math.min(bereits+offen, s.betragCent)*Math.min(anteilSoll, s.betragCent)/s.betragCent);
+    const teil = Math.max(0, Math.min(rest, ziel-schon));
+    if (teil>0){ neu(kaId, teil, bezPrefix); rest -= teil; }
+  }
+  if (rest>0) neu(s.kostenartId, rest, "Mieteingang (Ist) zu ");
   geaendert();
+}
+function eingangDialog(sollId){
+  const s = byId(Z.buchungen, sollId); if(!s||!s.istSoll) return;
+  const bereits = Z.buchungen.filter(b=>b.istAusgleichVonId===sollId&&!b.istSoll).reduce((a,b)=>a+b.betragCent,0);
+  const offen = s.betragCent-bereits;
+  modal("Mieteingang bestätigen", `
+    <p class="hinweis">${esc(s.bezeichnung)} — offen: <b>${euro(offen)}</b></p>
+    <div class="zeile"><div>${feld("ei_datum","Zahldatum laut Kontoauszug *",heute(),"date")}</div><div>${feldG("ei_betrag","Betrag",offen)}</div></div>
+    <p class="hinweis">Zuflussprinzip: Für die Steuer zählt das tatsächliche Zahldatum — beim Jahreswechsel entscheidend für das Steuerjahr.</p>`,
+    "Eingang buchen", () => {
+      const betrag = parseEuro(F("ei_betrag"));
+      if (!F("ei_datum") || betrag==null || betrag<=0){ alert("Zahldatum und Betrag angeben."); return false; }
+      eingangBestaetigen(sollId, Math.min(betrag, offen), F("ei_datum"));
+    });
 }
 /* ============ UI-Gerüst: Navigation, Modal, Formulare ============ */
 const SEITEN = [
   ["dashboard","📊","Dashboard"], ["objekte","🏠","Objekte"], ["kontakte","👤","Kontakte"],
   ["dokumente","📁","Dokumente"], ["inbox","📥","Inbox"], ["buchungen","💶","Buchungen"],
   ["belegimport","📄","Belegimport"], ["weg","🏢","WEG"], ["nebenkosten","🧾","Nebenkosten"],
-  ["rendite","📈","Rendite & AfA"], ["bilanz","⚖️","Bilanz"], ["daten","💾","Daten & Einstellungen"],
+  ["rendite","📈","Rendite & AfA"], ["steuer","📋","Steuer (Anlage V)"], ["bilanz","⚖️","Bilanz"], ["daten","💾","Daten & Einstellungen"],
 ];
 let seite = "dashboard";
 let auswahl = {};   // seitenspezifische Auswahl (z. B. gewähltes Objekt)
@@ -489,7 +574,7 @@ function rendern(){
   navRendern(); statusZeigen();
   const R = {dashboard:rDashboard, objekte:rObjekte, kontakte:rKontakte, dokumente:rDokumente,
     inbox:rInbox, buchungen:rBuchungen, belegimport:rBelegimport, weg:rWeg,
-    nebenkosten:rNebenkosten, rendite:rRendite, bilanz:rBilanz, daten:rDaten};
+    nebenkosten:rNebenkosten, rendite:rRendite, steuer:rSteuer, bilanz:rBilanz, daten:rDaten};
   const banner = (gemerkterHandle && !dateiHandle) ?
     `<div class="karte" style="border-color:var(--akzent);display:flex;gap:12px;align-items:center;flex-wrap:wrap">
       <span>📄 Zuletzt verwendete Datendatei <b>${esc(gemerkterHandle.name)}</b> wieder verbinden?</span>
@@ -551,7 +636,7 @@ function rDashboard(){
     <td class="r">${euro(z.sollCent)}</td><td class="r">${euro(z.istCent)}</td>
     <td class="r">${z.offenCent>0?`<span class="rot">${euro(z.offenCent)}</span>`:euro(0)}</td>
     <td>${z.bezahlt?'<span class="pille ok">✓ bezahlt</span>':'<span class="pille warn">offen</span>'}</td>
-    <td>${z.bezahlt?"":`<button class="klein" onclick="eingangBestaetigen('${z.sollBuchung.id}');rendern()">Eingang bestätigen</button>`}</td>
+    <td>${z.bezahlt?"":`<button class="klein" onclick="eingangDialog('${z.sollBuchung.id}')">Eingang bestätigen</button>`}</td>
   </tr>`).join("")}</table>`}</div>`;
 }
 function aktionSollErzeugen(){
@@ -650,7 +735,7 @@ function kontoimportDialog(zeilen){
   modal("Kontoauszug-Import — Zuordnungsvorschläge", koerper, _vorschlaege.length?"Übernehmen":"", () => {
     let n=0;
     _vorschlaege.forEach((v,i)=>{
-      if (v.sollId && document.getElementById("vs"+i)?.checked){ eingangBestaetigen(v.sollId, Math.min(v.zeile.betragCent, v.offen)); n++; }
+      if (v.sollId && document.getElementById("vs"+i)?.checked){ eingangBestaetigen(v.sollId, Math.min(v.zeile.betragCent, v.offen), v.zeile.datum); n++; }
     });
     setTimeout(()=>alert(n+" Mieteingang/Mieteingänge gebucht."),50);
   });
@@ -699,6 +784,7 @@ function kontaktDialog(id){
       if (!id) Z.kontakte.push(ziel);
       geaendert();
     });
+  plzListener("k_plz","k_ort");
 }
 function kontaktLoeschen(id){
   if (Z.mietverhaeltnisse.some(m=>m.mieterId===id)) return alert("Kontakt ist als Mieter in einem Mietverhältnis hinterlegt und kann nicht gelöscht werden.");
@@ -726,12 +812,13 @@ function rObjektDetail(o){
   return `<div class="werkzeuge"><button onclick="delete auswahl.objektId;rendern()">← Zurück</button>
     <h2 style="margin:0">${esc(o.bezeichnung)}</h2><span class="sp"></span>
     <button onclick="objektDialog('${o.id}')">Stammdaten bearbeiten …</button>
-    <button onclick="kaufdatenDialog('${o.id}')">Kauf-/AfA-Daten …</button></div>
+    <button onclick="kaufdatenDialog('${o.id}')">Kauf-/AfA-Daten …</button>
+    <button onclick="kpaDialog('${o.id}')">Kaufpreisaufteilung (BMF) …</button></div>
   <div class="kennzahlen">
     <div class="kennzahl"><div class="label">Typ</div><div class="wert" style="font-size:15px">${esc(o.typ)}</div></div>
     <div class="kennzahl"><div class="label">Wohnfläche</div><div class="wert" style="font-size:15px">${(o.gesamtWohnflaeche||0).toLocaleString("de-DE")} m²</div></div>
     <div class="kennzahl"><div class="label">Kaufpreis</div><div class="wert" style="font-size:15px">${o.kaufpreisGesamtCent?euro(o.kaufpreisGesamtCent):"—"}</div></div>
-    <div class="kennzahl"><div class="label">AfA</div><div class="wert" style="font-size:15px">${o.afaTyp==="Neubau3Prozent"?"3 % (Neubau)":o.afaTyp?"2 % (Bestand)":"—"}</div></div>
+    <div class="kennzahl"><div class="label">AfA</div><div class="wert" style="font-size:15px">${esc(afaTypName(o.afaTyp))}</div></div>
   </div>
   <div class="karte"><h3 style="margin-top:0">Wohneinheiten</h3>
   <div class="werkzeuge"><button class="klein primaer" onclick="weDialog('${o.id}')">Neue Wohneinheit …</button></div>
@@ -749,7 +836,7 @@ function rObjektDetail(o){
       ${mvs.map(m=>`<tr ${m.mietende&&m.mietende<heute()?'class="muted"':''}>
         <td>${esc(kontaktName(m.mieterId))}</td>
         <td>${datumDE(m.mietbeginn)} – ${m.mietende?datumDE(m.mietende):"offen"}</td>
-        <td class="r">${euro(kaltmieteAm(m,heute()))}${(m.mieterhoehungen||[]).length?' <span class="chip" title="Mieterhöhungen erfasst">↑'+m.mieterhoehungen.length+'</span>':''}</td><td class="r">${m.garagenmieteCent?euro(m.garagenmieteCent):"—"}</td><td class="r">${euro(m.nkVorauszahlungCent||0)}</td>
+        <td class="r">${euro(kaltmieteAm(m,heute()))}${(m.mieterhoehungen||[]).length?' <span class="chip" title="Mietanpassungen erfasst">↑'+m.mieterhoehungen.length+'</span>':''}</td><td class="r">${garagenmieteAm(m,heute())?euro(garagenmieteAm(m,heute())):"—"}</td><td class="r">${euro(m.nkVorauszahlungCent||0)}</td>
         <td class="r">${euro(m.heizkostenVorauszahlungCent||0)}</td><td class="r"><b>${euro(gesamtmiete(m))}</b></td>
         <td class="r">${m.personenzahl||1}</td>
         <td style="white-space:nowrap"><button class="klein" onclick="mietErhDialog('${m.id}')">Miete ↑</button>
@@ -772,27 +859,77 @@ function objektDialog(id){
       Object.assign(ziel,{bezeichnung:F("o_bez"), typ:F("o_typ"),
         adresse:{strasse:F("o_str")||null,hausnummer:F("o_nr")||null,plz:F("o_plz")||null,ort:F("o_ort")||null},
         baujahr:F("o_bj")?+F("o_bj"):null, gesamtWohnflaeche:parseFloat(String(F("o_fl")).replace(",","."))||0});
+      if (!ziel.bundesland && _plzInfo && _plzInfo.plz===F("o_plz") && _plzInfo.land){
+        const bl = BUNDESLAENDER.find(b=>b[1]===_plzInfo.land);
+        if (bl) ziel.bundesland = bl[0];   // Bundesland aus PLZ → Grunderwerbsteuer-Vorbelegung
+      }
       if (!id) Z.objekte.push(ziel);
       geaendert();
     });
+  plzListener("o_plz","o_ort");
+}
+/* Grunderwerbsteuersätze je Bundesland (Stand 2026) sowie übliche Käufer-Maklerprovision (verhandelbar) */
+const BUNDESLAENDER = [["BW","Baden-Württemberg",5.0],["BY","Bayern",3.5],["BE","Berlin",6.0],["BB","Brandenburg",6.5],
+  ["HB","Bremen",5.5],["HH","Hamburg",5.5],["HE","Hessen",6.0],["MV","Mecklenburg-Vorpommern",6.0],
+  ["NI","Niedersachsen",5.0],["NW","Nordrhein-Westfalen",6.5],["RP","Rheinland-Pfalz",5.0],["SL","Saarland",6.5],
+  ["SN","Sachsen",5.5],["ST","Sachsen-Anhalt",5.0],["SH","Schleswig-Holstein",6.5],["TH","Thüringen",5.0]];
+const MAKLER_UEBLICH_PROZENT = 3.57;   // Käuferanteil inkl. USt (hälftige Teilung §656c/d BGB bei EFH/ETW; bei MFH frei verhandelbar)
+const NOTAR_GRUNDBUCH_PROZENT = 2.0;   // Notar ca. 1,5 % + Grundbuch ca. 0,5 % (GNotKG; Pauschalannahme)
+function nkAusSaetzen(kpCent, beweglichCent, grestProzent, notarProzent, maklerProzent){
+  const basisCent = Math.max(0, (kpCent||0) - (beweglichCent||0));
+  const grestCent = Math.round(basisCent*grestProzent/100);
+  const notarCent = Math.round(basisCent*notarProzent/100);
+  const maklerCent = Math.round(basisCent*maklerProzent/100);
+  return {basisCent, grestCent, notarCent, maklerCent, summeCent:grestCent+notarCent+maklerCent};
+}
+function kdNkBerechnen(){
+  const p = id => parseFloat((F(id)||"0").replace(/\./g,"").replace(",","."))||0;
+  const r = nkAusSaetzen(parseEuro(F("kd_ges"))||0, parseEuro(F("kd_beweglich"))||0, p("kd_grest"), p("kd_notar"), p("kd_makler"));
+  const nk = document.getElementById("kd_nk");
+  if (nk) nk.value = (r.summeCent/100).toLocaleString("de-DE",{minimumFractionDigits:2,useGrouping:false});
+  const info = document.getElementById("kd_nk_info");
+  if (info) info.innerHTML = `Basis ${euro(r.basisCent)} (Kaufpreis − bewegliche Sachen) → Grunderwerbsteuer ${euro(r.grestCent)} + Notar/Grundbuch ${euro(r.notarCent)} + Makler ${euro(r.maklerCent)} = <b>${euro(r.summeCent)}</b> (in „Kaufnebenkosten" übernommen)`;
 }
 function kaufdatenDialog(id){
   const o = byId(Z.objekte,id); if(!o) return;
+  const s = o.nkSaetze||{};
+  const blSatz = bl => (BUNDESLAENDER.find(b=>b[0]===bl)||[])[2];
   modal("Kauf- und AfA-Daten — "+o.bezeichnung, `
-    ${feld("kd_datum","Kaufdatum",o.kaufdatum,"date")}
-    <div class="zeile"><div>${feldG("kd_ges","Kaufpreis gesamt",o.kaufpreisGesamtCent)}</div><div>${feldG("kd_nk","Kaufnebenkosten",o.kaufnebenkostenCent)}</div></div>
+    ${feld("kd_datum","Kaufdatum (notarieller Kaufvertrag)",o.kaufdatum,"date")}
+    <div class="zeile"><div>${feldG("kd_ges","Kaufpreis gesamt (laut Vertrag)",o.kaufpreisGesamtCent)}</div><div>${feldG("kd_beweglich","davon bewegliche Sachen (Küche, Heizöl, Möbel …)",o.kaufpreisBeweglichCent)}</div></div>
+    <p class="hinweis">Im Kaufvertrag gesondert ausgewiesene bewegliche Sachen mindern die Bemessungsgrundlage von Grunderwerbsteuer und Maklerprovision sowie die AfA-Aufteilungsbasis. Ggf. sind sie separat abschreibbar. Realistisch beziffern (Belege!).</p>
+    <h3>Kaufnebenkosten</h3>
+    ${auswahlFeld("kd_bl","Bundesland (setzt den Grunderwerbsteuersatz)",[["","— wählen —"]].concat(BUNDESLAENDER.map(b=>[b[0],b[1]+" ("+String(b[2]).replace(".",",")+" %)"])),o.bundesland||"")}
+    <div class="zeile"><div>${feld("kd_grest","Grunderwerbsteuer %",s.grest!=null?String(s.grest).replace(".",","):(blSatz(o.bundesland)!=null?String(blSatz(o.bundesland)).replace(".",","):""))}</div>
+    <div>${feld("kd_notar","Notar/Grundbuch %",s.notar!=null?String(s.notar).replace(".",","):String(NOTAR_GRUNDBUCH_PROZENT).replace(".",","))}</div>
+    <div>${feld("kd_makler","Makler (Käuferanteil) %",s.makler!=null?String(s.makler).replace(".",","):String(MAKLER_UEBLICH_PROZENT).replace(".",","))}</div></div>
+    <div class="werkzeuge"><button class="klein" onclick="kdNkBerechnen()">Nebenkosten aus Sätzen berechnen</button></div>
+    <div id="kd_nk_info" class="hinweis"></div>
+    ${feldG("kd_nk","Kaufnebenkosten (berechnet oder manuell)",o.kaufnebenkostenCent)}
+    <h3>Aufteilung & AfA</h3>
     <div class="zeile"><div>${feldG("kd_geb","davon Gebäude",o.kaufpreisGebaeudeCent)}</div><div>${feldG("kd_grund","davon Grund & Boden",o.kaufpreisGrundCent)}</div></div>
-    ${auswahlFeld("kd_afa","AfA-Typ (§7 Abs. 4 EStG)",[["","— kein —"],["Bestand2Prozent","2 % Bestand"],["Neubau3Prozent","3 % Neubau (Bauantrag ab 2023)"]],o.afaTyp||"")}
+    <p class="hinweis">Tipp: Die Aufteilung Gebäude/Grund lässt sich über „Kaufpreisaufteilung (BMF) …" im Objekt typisiert berechnen.</p>
+    ${auswahlFeld("kd_afa","AfA-Typ (§7 Abs. 4 / 5a EStG)",AFA_TYPEN,o.afaTyp||"")}
+    ${feld("kd_restnd","Restnutzungsdauer in Jahren (nur bei AfA nach Gutachten)",o.restnutzungsdauerJahre,"number")}
+    <p class="hinweis">Degressive 5 %-AfA: nur Wohnzweck und Baubeginn bzw. Kaufvertrag zwischen 1.10.2023 und 30.9.2029 (Anschaffung bis Ende des Fertigstellungsjahres). Das Tool wechselt automatisch zur linearen Rest-AfA, sobald diese günstiger ist (§7 Abs. 5a Satz 7 EStG). Die AfA beginnt monatsgenau ab dem Anschaffungsmonat.</p>
     <h3>Finanzierung (optional, für EK-Rendite)</h3>
     <div class="zeile"><div>${feldG("kd_darl","Darlehensbetrag",o.darlehensbetragCent)}</div>
     <div>${feld("kd_zins","Zinssatz (% p. a.)",o.zinssatzProzent)}</div></div>`,
     "Speichern", () => {
+      const pz = id => F(id)!=="" ? parseFloat(F(id).replace(/\./g,"").replace(",","."))||0 : null;
       Object.assign(o,{kaufdatum:F("kd_datum")||null, kaufpreisGesamtCent:parseEuro(F("kd_ges")),
+        kaufpreisBeweglichCent:parseEuro(F("kd_beweglich"))||0, bundesland:F("kd_bl")||null,
+        nkSaetze:{grest:pz("kd_grest"), notar:pz("kd_notar"), makler:pz("kd_makler")},
         kaufnebenkostenCent:parseEuro(F("kd_nk")), kaufpreisGebaeudeCent:parseEuro(F("kd_geb")),
         kaufpreisGrundCent:parseEuro(F("kd_grund")), afaTyp:F("kd_afa")||null,
+        restnutzungsdauerJahre:+F("kd_restnd")||null,
         darlehensbetragCent:parseEuro(F("kd_darl")), zinssatzProzent:F("kd_zins")?parseFloat(F("kd_zins").replace(",",".")):null});
       geaendert();
     });
+  document.getElementById("kd_bl").addEventListener("change", ev => {
+    const bl = BUNDESLAENDER.find(b=>b[0]===ev.target.value);
+    if (bl) document.getElementById("kd_grest").value = String(bl[2]).replace(".",",");
+  });
 }
 function objektLoeschen(id){
   if (Z.buchungen.some(b=>b.objektId===id)) return alert("Objekt hat Buchungen und kann nicht gelöscht werden.");
@@ -899,20 +1036,26 @@ function mvDialog(weId, id){
 function mietErhDialog(mvId){
   const mv = byId(Z.mietverhaeltnisse,mvId); if(!mv) return;
   const liste = [...(mv.mieterhoehungen||[])].sort((a,b)=>a.gueltigAb.localeCompare(b.gueltigAb));
-  modal("Mieterhöhungen — "+kontaktName(mv.mieterId), `
-    <p class="hinweis">Ausgangs-Kaltmiete: ${euro(mv.kaltmieteCent||0)} ab ${datumDE(mv.mietbeginn)} · aktuell gültig: <b>${euro(kaltmieteAm(mv,heute()))}</b></p>
-    ${liste.length?`<table><tr><th>Gültig ab</th><th class="r">Neue Kaltmiete</th><th>Grund</th><th></th></tr>
-      ${liste.map(e=>`<tr><td>${datumDE(e.gueltigAb)}</td><td class="r">${euro(e.neueKaltmieteCent)}</td><td>${esc(e.grund||"")}</td>
+  modal("Mietanpassungen — "+kontaktName(mv.mieterId), `
+    <p class="hinweis">Ausgangs-Kaltmiete: ${euro(mv.kaltmieteCent||0)} ab ${datumDE(mv.mietbeginn)} · aktuell gültig: <b>${euro(kaltmieteAm(mv,heute()))}</b>
+    · Garage/Stellplatz aktuell: <b>${euro(garagenmieteAm(mv,heute()))}</b></p>
+    ${liste.length?`<table><tr><th>Gültig ab</th><th class="r">Kaltmiete</th><th class="r">Garage</th><th>Grund</th><th></th></tr>
+      ${liste.map(e=>`<tr><td>${datumDE(e.gueltigAb)}</td><td class="r">${e.neueKaltmieteCent!=null?euro(e.neueKaltmieteCent):"—"}</td>
+      <td class="r">${e.neueGaragenmieteCent!=null?euro(e.neueGaragenmieteCent):"—"}</td><td>${esc(e.grund||"")}</td>
       <td><button class="klein gefahr" onclick="mietErhLoeschen('${mvId}','${e.id}')">×</button></td></tr>`).join("")}</table>`
-      :'<p class="hinweis">Noch keine Erhöhung erfasst.</p>'}
-    <h3>Neue Erhöhung</h3>
-    <div class="zeile"><div>${feld("me_ab","Gültig ab *","","date")}</div><div>${feldG("me_kalt","Neue Kaltmiete *",null)}</div></div>
+      :'<p class="hinweis">Noch keine Anpassung erfasst.</p>'}
+    <h3>Neue Anpassung</h3>
+    <div class="zeile"><div>${feld("me_ab","Gültig ab *","","date")}</div><div>${feldG("me_kalt","Neue Kaltmiete (leer = unverändert)",null)}</div></div>
+    ${feldG("me_garage","Neue Garagen-/Stellplatzmiete (leer = unverändert)",null)}
     ${feld("me_grund","Grund (z. B. Anpassung §558 BGB, Indexmiete)")}
-    <p class="hinweis">Die Soll-Stellung nutzt automatisch je Monat den dann gültigen Betrag. Bereits erzeugte Soll-Buchungen bleiben unverändert.</p>`,
-    "Erhöhung speichern", () => {
-      const ab = F("me_ab"), kalt = parseEuro(F("me_kalt"));
-      if (!ab || kalt==null){ alert("Datum und neue Kaltmiete angeben."); return false; }
-      (mv.mieterhoehungen ||= []).push({id:uid(), gueltigAb:ab, neueKaltmieteCent:Math.abs(kalt), grund:F("me_grund")||null});
+    <p class="hinweis">Die Soll-Stellung nutzt automatisch je Monat die dann gültigen Beträge. Bereits erzeugte Soll-Buchungen bleiben unverändert.</p>`,
+    "Anpassung speichern", () => {
+      const ab = F("me_ab"), kalt = parseEuro(F("me_kalt")), garage = parseEuro(F("me_garage"));
+      if (!ab || (kalt==null && garage==null)){ alert("Datum und mindestens einen neuen Betrag angeben."); return false; }
+      const e = {id:uid(), gueltigAb:ab, grund:F("me_grund")||null};
+      if (kalt!=null) e.neueKaltmieteCent = Math.abs(kalt);
+      if (garage!=null) e.neueGaragenmieteCent = Math.abs(garage);
+      (mv.mieterhoehungen ||= []).push(e);
       geaendert();
     });
 }
@@ -1289,13 +1432,14 @@ function nkDetail(a){
       ${a.status==="Entwurf"&&a.mieterAbrechnungen?.length?`<button onclick="nkAbschliessen('${a.id}')">Salden verbuchen &amp; abschließen</button>`:""}
     </div>
     ${a.mieterAbrechnungen?.length?`<h3>Mieter-Abrechnungen</h3>
-    <table><tr><th>Einheit</th><th>Mieter</th><th>Nutzungszeitraum</th><th class="r">Kostenanteil</th><th class="r">Vorauszahlungen</th><th class="r">Saldo</th></tr>
+    <table><tr><th>Einheit</th><th>Mieter</th><th>Nutzungszeitraum</th><th class="r">Kostenanteil</th><th class="r">Vorauszahlungen</th><th class="r">Saldo</th><th></th></tr>
     ${a.mieterAbrechnungen.map(m=>{
       const anteil = m.anteile.reduce((x,t)=>x+t.anteilCent,0);
       return `<tr><td>${esc(weName(m.wohneinheitId))}</td><td>${esc(m.mieterName)}${m.verbrauchFehlt?' <span class="gelb" title="Zählerstände unvollständig — Verbrauchspositionen nach Fläche verteilt">⚠</span>':""}</td>
       <td>${m.nutzungVon?datumDE(m.nutzungVon)+" – "+datumDE(m.nutzungBis):"—"}</td>
       <td class="r">${euro(anteil)}</td><td class="r">${euro(m.vorauszahlungenCent)}</td>
-      <td class="r">${m.saldoCent>=0?`<span class="gruen">${euro(m.saldoCent)} Guthaben</span>`:`<span class="rot">${euro(-m.saldoCent)} Nachzahlung</span>`}</td></tr>`;
+      <td class="r">${m.saldoCent>=0?`<span class="gruen">${euro(m.saldoCent)} Guthaben</span>`:`<span class="rot">${euro(-m.saldoCent)} Nachzahlung</span>`}</td>
+      <td><button class="klein" onclick="vzAnpassenDialog('${a.id}','${m.id}')">VZ anpassen …</button></td></tr>`;
     }).join("")}</table>`:""}
   </div>`;
 }
@@ -1380,7 +1524,8 @@ function nkVerteilen(abrId){
     let vz = ((mv.nkVorauszahlungCent||0)+(mv.heizkostenVorauszahlungCent||0)) * monateAktiv(mv, a.zeitraumVon, a.zeitraumBis);
     if (segmenteJeWe[we.id]===1){
       const gebucht = Z.buchungen.filter(b=>b.objektId===a.objektId && b.wohneinheitId===we.id && !b.istSoll
-        && b.datum>=a.zeitraumVon && b.datum<=a.zeitraumBis && (b.kostenartId==="nkvz"||b.kostenartId==="hzvz"))
+        && b.datum>=a.zeitraumVon && b.datum<=a.zeitraumBis && (b.kostenartId==="nkvz"||b.kostenartId==="hzvz")
+        && b.quelle!=="SollStellung")   // automatisch gesplittete Mieteingänge nicht doppelt zählen — VZ-Ansatz bleibt die Soll-Pauschale
         .reduce((x,b)=>x+b.betragCent,0);
       if (gebucht>0) vz = gebucht;
     }
@@ -1436,6 +1581,27 @@ function nkAbschliessen(abrId){
   }
   a.status = "Abgeschlossen";
   geaendert(); rendern();
+}
+function vzAnpassenDialog(abrId, maId){
+  const a = byId(Z.nkAbrechnungen,abrId); const ma = byId(a?.mieterAbrechnungen||[],maId); if(!ma) return;
+  const mv = Z.mietverhaeltnisse.find(m=>m.wohneinheitId===ma.wohneinheitId && m.mieterId===ma.mieterId && (!m.mietende || m.mietende>=heute()));
+  if (!mv) return alert("Kein aktives Mietverhältnis zu dieser Abrechnung gefunden — VZ bitte direkt am Mietverhältnis ändern.");
+  const anteil = ma.anteile.reduce((x,t)=>x+t.anteilCent,0);
+  const monate = Math.max(1, monateAktiv(mv, a.zeitraumVon, a.zeitraumBis));
+  const proMonat = Math.round(anteil/monate);
+  const vorschlag = Math.ceil(proMonat/500)*500;
+  modal("Vorauszahlungen anpassen — "+ma.mieterName, `
+    <p class="hinweis">Kostenanteil laut Abrechnung: ${euro(anteil)} für ${monate} Monat(e) → Ø ${euro(proMonat)}/Monat.
+    Vorschlag Gesamt-VZ (auf 5 € aufgerundet): <b>${euro(vorschlag)}</b> · bisher gesamt: ${euro((mv.nkVorauszahlungCent||0)+(mv.heizkostenVorauszahlungCent||0))}</p>
+    <div class="zeile"><div>${feldG("vz_nk","Neue NK-Vorauszahlung",mv.nkVorauszahlungCent)}</div><div>${feldG("vz_hz","Neue Heizkosten-VZ",mv.heizkostenVorauszahlungCent)}</div></div>
+    <p class="hinweis">Wirkt auf künftig erzeugte Soll-Buchungen; bereits erzeugte Monate bleiben unverändert. Anpassung dem Mieter mitteilen (§560 BGB).</p>`,
+    "Übernehmen", () => {
+      const nk = parseEuro(F("vz_nk")), hz = parseEuro(F("vz_hz"));
+      if (nk==null && hz==null){ alert("Mindestens einen Betrag angeben."); return false; }
+      if (nk!=null) mv.nkVorauszahlungCent = Math.abs(nk);
+      if (hz!=null) mv.heizkostenVorauszahlungCent = Math.abs(hz);
+      geaendert();
+    });
 }
 function nkDrucken(abrId){
   const a = byId(Z.nkAbrechnungen,abrId); if(!a?.mieterAbrechnungen?.length) return;
@@ -1592,11 +1758,12 @@ function rRendite(){
       return `<tr><td>${j}</td><td class="r">${euro(ein)}</td><td class="r">${euro(aus)}</td><td class="r"><b>${euroF(cf)}</b></td>
       <td><span class="balken ${cf<0?'neg':''}" style="width:${Math.round(Math.abs(cf)/max*100)}%"></span></td></tr>`;
     }).join("")}</table>`}</div>
-  <div class="karte"><h3 style="margin-top:0">AfA-Tabelle (linear, §7 Abs. 4 EStG)</h3>
+  <div class="karte"><h3 style="margin-top:0">AfA-Tabelle (${esc(afaTypName(o.afaTyp))})</h3>
     ${!afa.length?'<div class="hinweis">Für die AfA-Tabelle Kaufdatum, Gebäudewert und AfA-Typ am Objekt hinterlegen.</div>':
-    `<p class="hinweis">Bemessungsgrundlage: ${euro(afa[0].bmg)} (Gebäudewert + anteilige Nebenkosten; Grundanteil wird nicht abgeschrieben)</p>
+    `<p class="hinweis">Bemessungsgrundlage: ${euro(afa[0].bmg)} (Gebäudewert + anteilige Nebenkosten; Grundanteil wird nicht abgeschrieben) · Anschaffungsjahr monatsgenau</p>
     <table><tr><th>Jahr</th><th class="r">AfA</th><th class="r">Kumuliert</th><th class="r">Restbuchwert</th></tr>
-    ${afa.map(z=>`<tr><td>${z.jahr}</td><td class="r">${euro(z.afaCent)}</td><td class="r">${euro(z.kumuliertCent)}</td><td class="r">${euro(z.restCent)}</td></tr>`).join("")}</table>`}</div>`;
+    ${afa.slice(0,45).map(z=>`<tr><td>${z.jahr}${z.linear&&o.afaTyp==="Degressiv5"?' <span class="chip" title="Ab hier lineare Rest-AfA (§7 Abs. 5a S. 7)">linear</span>':""}</td><td class="r">${euro(z.afaCent)}</td><td class="r">${euro(z.kumuliertCent)}</td><td class="r">${euro(z.restCent)}</td></tr>`).join("")}</table>
+    ${afa.length>45?'<p class="hinweis">Tabelle auf 45 Jahre gekürzt.</p>':""}`}</div>`;
 }
 function renditeBerechnen(o, jahr){
   const bs = Z.buchungen.filter(b=>b.objektId===o.id && !b.istSoll && +b.datum.slice(0,4)===jahr);
@@ -1608,13 +1775,12 @@ function renditeBerechnen(o, jahr){
   const cashflow = ein+aus;
   const kp = o.kaufpreisGesamtCent, nk = o.kaufnebenkostenCent||0;
   const ek = kp!=null ? kp+nk-(o.darlehensbetragCent||0) : null;
-  const bmg = afaBmg(o);
   return {
     brutto: kp>0 ? kalt/kp : null,
     netto: kp>0 ? (kalt+nichtUmlage)/(kp+nk) : null,
     ek: ek>0 ? cashflow/ek : null,
     cashflowCent: cashflow,
-    afaJahrCent: (bmg && o.afaTyp) ? Math.round(bmg*(o.afaTyp==="Neubau3Prozent"?0.03:0.02)) : 0,
+    afaJahrCent: afaTabelle(o).find(z=>z.jahr===jahr)?.afaCent||0,
   };
 }
 function afaBmg(o){
@@ -1624,20 +1790,316 @@ function afaBmg(o){
   const anteil = gesamt>0 ? geb/gesamt : 1;
   return geb + Math.round((o.kaufnebenkostenCent||0)*anteil);
 }
+const AFA_TYPEN = [["","— kein —"],["Altbau25","2,5 % linear (Fertigstellung vor 1925)"],["Bestand2Prozent","2 % linear (Bestand 1925–2022)"],["Neubau3Prozent","3 % linear (Fertigstellung ab 2023)"],["Degressiv5","5 % degressiv vom Restwert (§7 Abs. 5a)"],["RestND","Linear über Restnutzungsdauer (Gutachten, §7 Abs. 4 S. 2)"]];
+const afaTypName = t => (AFA_TYPEN.find(x=>x[0]===(t||""))||["","—"])[1];
+function afaSatz(o){
+  if (o.afaTyp==="Neubau3Prozent") return 0.03;
+  if (o.afaTyp==="Altbau25") return 0.025;
+  if (o.afaTyp==="RestND") return (o.restnutzungsdauerJahre>0 ? 1/o.restnutzungsdauerJahre : 0);
+  return o.afaTyp ? 0.02 : 0;
+}
+/* AfA-Tabelle: monatsgenau im Anschaffungsjahr (§7 Abs. 1 S. 4 EStG); degressiv 5 % vom Restwert
+   mit automatischem Wechsel zur linearen Rest-AfA, sobald diese höher ist (§7 Abs. 5a S. 7 EStG). */
 function afaTabelle(o){
   const bmg = afaBmg(o);
   if (!bmg || !o.afaTyp || !o.kaufdatum) return [];
-  const satz = o.afaTyp==="Neubau3Prozent"?0.03:0.02;
-  const jahresAfa = Math.round(bmg*satz);
-  const start = +o.kaufdatum.slice(0,4);
+  const startJahr = +o.kaufdatum.slice(0,4);
+  const anteilJ1 = (13 - (+o.kaufdatum.slice(5,7)||1))/12;
   const zeilen = []; let kum = 0;
-  for (let i=0; i<60; i++){
-    const afa = Math.min(jahresAfa, Math.max(0,bmg-kum));
-    kum += afa;
-    zeilen.push({jahr:start+i, afaCent:afa, kumuliertCent:kum, restCent:Math.max(0,bmg-kum), bmg});
-    if (kum>=bmg) break;
+  if (o.afaTyp==="Degressiv5"){
+    let rw = bmg, restND = 100/3, gewechselt = false;
+    for (let i=0; i<80 && rw>0; i++){
+      const zeit = i===0 ? anteilJ1 : 1;
+      const linear = restND>0 ? rw/restND : rw;
+      if (!gewechselt && linear >= rw*0.05) gewechselt = true;
+      const afa = Math.min(rw, Math.round((gewechselt ? linear : rw*0.05)*zeit));
+      rw -= afa; kum += afa; restND -= zeit;
+      zeilen.push({jahr:startJahr+i, afaCent:afa, kumuliertCent:kum, restCent:rw, bmg, linear:gewechselt});
+    }
+  } else {
+    const jahresAfa = Math.round(bmg*afaSatz(o));
+    if (!jahresAfa) return [];
+    for (let i=0; i<90; i++){
+      const zeit = i===0 ? anteilJ1 : 1;
+      const afa = Math.min(Math.round(jahresAfa*zeit), Math.max(0,bmg-kum));
+      kum += afa;
+      zeilen.push({jahr:startJahr+i, afaCent:afa, kumuliertCent:kum, restCent:Math.max(0,bmg-kum), bmg});
+      if (kum>=bmg) break;
+    }
   }
   return zeilen;
+}
+
+/* ============ Kaufpreisaufteilung nach BMF-Arbeitshilfe (Stand Februar 2026), typisiert ============ */
+/* Baupreisindex Wohngebäude, Jahresdurchschnitt, 2010 = 100 (Destatis, umbasiert; 2026 = Q1 vorläufig) */
+const KPA_INDEX = {2008:98.2,2009:99.0,2010:100.0,2011:102.8,2012:105.4,2013:107.5,2014:109.4,2015:111.1,2016:113.4,2017:116.8,2018:122.0,2019:127.2,2020:129.2,2021:140.9,2022:164.0,2023:177.9,2024:183.2,2025:189.1,2026:193.5};
+/* Bewirtschaftungskosten je Anschaffungsjahr (Anlage 3 ImmoWertV, VPI-fortgeschrieben):
+   [Verwaltung €/Wohnung bzw. EFH, Verwaltung €/ETW, Verwaltung €/Garage, Instandhaltung €/m² WF, Instandhaltung €/Garage] */
+const KPA_BEWK = {2015:[281,336,37,11.0,83],2016:[283,338,37,11.1,84],2017:[285,341,37,11.2,84],2018:[289,346,38,11.3,85],2019:[296,353,39,11.6,87],2020:[299,357,39,11.7,88],2021:[298,356,39,11.7,88],2022:[311,372,41,12.2,92],2023:[339,405,44,13.3,100],2024:[351,420,46,13.8,104],2025:[359,429,47,14.0,106],2026:[367,439,48,14.4,108]};
+/* NHK 2010 (Anlage 4 ImmoWertV): [id, Bezeichnung, Stufe 2, Stufe 3, Stufe 4, BGF-zu-WF-Faktor]
+   Standardstufe wird nach BMF-Vereinfachung aus dem Baujahr abgeleitet: vor 1995 → 2, 1995–2004 → 3, ab 2005 → 4. */
+const KPA_NHK = [
+  ["etw","Wohnungseigentum (ETW)",718,825,985,1.9],
+  ["mfh","Mehrfamilienhaus (Mietwohngrundstück)",718,825,985,1.9],
+  ["gemischt","Wohnhaus mit Mischnutzung (25–75 % Wohnen)",748,860,1085,2.0],
+  ["efh101","EFH freist.: KG, EG, DG ausgebaut",725,835,1005,2.3],
+  ["efh102","EFH freist.: KG, EG, DG nicht ausgebaut",605,695,840,3.8],
+  ["efh103","EFH freist.: KG, EG, Flachdach",785,900,1085,2.6],
+  ["efh111","EFH freist.: KG, EG, OG, DG ausgebaut",725,835,1005,1.9],
+  ["efh112","EFH freist.: KG, EG, OG, DG nicht ausgebaut",635,730,880,2.8],
+  ["efh113","EFH freist.: KG, EG, OG, Flachdach",740,850,1025,2.1],
+  ["efh121","EFH freist.: EG, ohne Keller, DG ausgebaut",875,1005,1215,1.6],
+  ["efh122","EFH freist.: EG, ohne Keller, DG nicht ausgebaut",650,745,900,2.6],
+  ["efh123","EFH freist.: EG, ohne Keller, Flachdach",1025,1180,1420,1.4],
+  ["efh131","EFH freist.: EG, OG, ohne Keller, DG ausgebaut",800,920,1105,1.5],
+  ["efh132","EFH freist.: EG, OG, ohne Keller, DG nicht ausgebaut",690,790,955,2.1],
+  ["efh133","EFH freist.: EG, OG, ohne Keller, Flachdach",870,1000,1205,1.4],
+  ["dh201","DHH/REH-End: KG, EG, DG ausgebaut",685,785,945,2.0],
+  ["dh202","DHH/REH-End: KG, EG, DG nicht ausgebaut",570,655,790,3.9],
+  ["dh203","DHH/REH-End: KG, EG, Flachdach",735,845,1020,2.6],
+  ["dh211","DHH/REH-End: KG, EG, OG, DG ausgebaut",685,785,945,1.8],
+  ["dh212","DHH/REH-End: KG, EG, OG, DG nicht ausgebaut",595,685,825,2.6],
+  ["dh213","DHH/REH-End: KG, EG, OG, Flachdach",695,800,965,1.9],
+  ["dh221","DHH/REH-End: EG, ohne Keller, DG ausgebaut",825,945,1140,1.3],
+  ["dh222","DHH/REH-End: EG, ohne Keller, DG nicht ausgebaut",610,700,845,2.6],
+  ["dh223","DHH/REH-End: EG, ohne Keller, Flachdach",965,1105,1335,1.4],
+  ["dh231","DHH/REH-End: EG, OG, ohne Keller, DG ausgebaut",750,865,1040,1.4],
+  ["dh232","DHH/REH-End: EG, OG, ohne Keller, DG nicht ausgebaut",645,745,895,2.0],
+  ["dh233","DHH/REH-End: EG, OG, ohne Keller, Flachdach",820,940,1135,1.3],
+  ["rm301","Reihenmittelhaus: KG, EG, DG ausgebaut",640,735,885,2.0],
+  ["rm302","Reihenmittelhaus: KG, EG, DG nicht ausgebaut",535,615,740,3.9],
+  ["rm303","Reihenmittelhaus: KG, EG, Flachdach",690,795,955,2.6],
+  ["rm311","Reihenmittelhaus: KG, EG, OG, DG ausgebaut",640,735,885,1.8],
+  ["rm312","Reihenmittelhaus: KG, EG, OG, DG nicht ausgebaut",560,640,775,2.6],
+  ["rm313","Reihenmittelhaus: KG, EG, OG, Flachdach",650,750,905,1.9],
+  ["rm321","Reihenmittelhaus: EG, ohne Keller, DG ausgebaut",770,885,1065,1.3],
+  ["rm322","Reihenmittelhaus: EG, ohne Keller, DG nicht ausgebaut",570,655,790,2.6],
+  ["rm323","Reihenmittelhaus: EG, ohne Keller, Flachdach",900,1035,1250,1.4],
+  ["rm331","Reihenmittelhaus: EG, OG, ohne Keller, DG ausgebaut",705,810,975,1.4],
+  ["rm332","Reihenmittelhaus: EG, OG, ohne Keller, DG nicht ausgebaut",605,695,840,2.0],
+  ["rm333","Reihenmittelhaus: EG, OG, ohne Keller, Flachdach",765,880,1060,1.3],
+];
+const KPA_GND = 80;   // Gesamtnutzungsdauer Wohngebäude, Anlage 1 ImmoWertV
+const kpaRnd = (kaufjahr, baujahr) => Math.max(KPA_GND - Math.max(0, kaufjahr-baujahr), Math.round(KPA_GND*0.3));
+/* Typisierte Liegenschaftszinssätze (§§ 188 Abs. 2, 193 Abs. 4 BewG), editierbar */
+const KPA_LZ = {etw:3.0, mfh:3.5, gemischt:4.5, efh:2.5};
+
+function kpaBerechnen(e){
+  const mea = (e.meaZ>0 && e.meaN>0) ? e.meaZ/e.meaN : 1;
+  const bodenwertCent = Math.round(((e.flaeche1||0)*(e.brw1||0) + (e.flaeche2||0)*(e.brw2||0)) * mea * 100);
+  const rnd = kpaRnd(e.kaufjahr, e.baujahr);
+  let verfahren, gebaeudewertCent, details = {rnd};
+  if (e.vergleichsfaktor>0){
+    /* Vergleichswertverfahren: objektspezifischer Vergleichsfaktor €/m² × Wohnfläche (+ Stellplätze) */
+    verfahren = "Vergleichswertverfahren";
+    const vw = Math.round(e.vergleichsfaktor*e.wohnflaeche*100) + Math.round((e.vfGarage||0)*(e.anzahlGaragen||0)*100);
+    gebaeudewertCent = vw - bodenwertCent;
+    details.vergleichswertCent = vw;
+  } else if (e.mieteMonatCent>0){
+    /* Ertragswertverfahren (§ 28 ImmoWertV): Rohertrag − BewK − Bodenwertverzinsung, kapitalisiert über RND */
+    verfahren = "Ertragswertverfahren";
+    const roh = e.mieteMonatCent*12;
+    const b = KPA_BEWK[Math.min(2026, Math.max(2015, e.kaufjahr))];
+    const einheiten = e.anzahlEinheiten || Math.max(1, Math.round((e.wohnflaeche||94)/94));
+    const verwSatz = e.grundArt==="etw" ? b[1] : b[0];
+    const bewk = Math.round(einheiten*verwSatz*100 + (e.anzahlGaragen||0)*(b[2]+b[4])*100 + (e.wohnflaeche||0)*b[3]*100 + roh*0.02);
+    const rein = roh - bewk;
+    const lz = (e.lz||3.5)/100;
+    const bwvz = Math.round((e.flaeche1||0)*(e.brw1||0)*mea*100*lz);   // selbständig nutzbare Teilfläche 2 ohne Verzinsung
+    const gebRein = rein - bwvz;
+    const q = Math.pow(1+lz, rnd);
+    const bwf = Math.round((lz>0 ? (q-1)/(q*lz) : rnd)*10000)/10000;
+    gebaeudewertCent = Math.round(gebRein*bwf);
+    Object.assign(details, {rohertragCent:roh, bewkCent:bewk, reinertragCent:rein, bwVerzinsungCent:bwvz, gebaeudereinertragCent:gebRein, barwertfaktor:bwf});
+    if (gebRein<=0) details.warnung = "Gebäudereinertrag ≤ 0: Missverhältnis zum Bodenwert (ggf. Liquidationsobjekt) — Ergebnis nicht verwertbar, Angaben prüfen.";
+  } else {
+    /* Sachwertverfahren (§§ 35 ff. ImmoWertV): NHK × BGF/WF-Faktor, +3 % Außenanlagen, indiziert, regionalisiert, Alterswertminderung */
+    verfahren = "Sachwertverfahren";
+    const z = KPA_NHK.find(x=>x[0]===e.nhkId) || KPA_NHK[0];
+    let nhk = e.nhkWert || (e.baujahr<1995 ? z[2] : e.baujahr<2005 ? z[3] : z[4]);
+    if (e.zfh) nhk *= 1.05;
+    if ((e.grundArt==="etw"||e.grundArt==="mfh") && !e.nhkWert){
+      if (e.wohnflaeche<=35) nhk *= 1.1; else if (e.wohnflaeche>=135) nhk *= 0.85;
+    }
+    const idx = e.indexWert || KPA_INDEX[e.kaufjahr] || KPA_INDEX[2026];
+    const awf = rnd/KPA_GND;
+    const r0 = x => Math.round(x + 1e-9);   // kaufmännische Zwischenrundung wie BMF-Excel, robust gegen Float-Artefakte (835×2,3)
+    let thk = r0(nhk*z[5]);
+    thk = r0(thk*1.03);
+    thk = r0(thk*idx/100);
+    thk = r0(thk*(e.regionalfaktor||1));
+    thk = r0(thk*awf);
+    let gsw = Math.round(thk*(e.wohnflaeche||0)*100);
+    if (e.anzahlGaragen>0){   // Garagen typisiert: NHK 14.1 Stufe 4 (485 €/m² BGF), 20 m² je Garage
+      gsw += Math.round(485*20*(idx/100)*(e.regionalfaktor||1)*awf*(e.anzahlGaragen||0)*100);
+    }
+    const vorl = Math.round((bodenwertCent+gsw)*(e.sachwertfaktor||1));
+    gebaeudewertCent = vorl - bodenwertCent;
+    Object.assign(details, {nhkProM2:nhk, thkProM2:thk, gebaeudesachwertCent:gsw, vorlSachwertCent:vorl, awf, indexWert:idx});
+  }
+  gebaeudewertCent = Math.max(0, gebaeudewertCent);
+  const summe = bodenwertCent + gebaeudewertCent;
+  const quoteGebaeude = summe>0 ? gebaeudewertCent/summe : 0;
+  return {verfahren, bodenwertCent, gebaeudewertCent, quoteGebaeude, details};
+}
+let _kpaErgebnis = null;
+function kpaDialog(objektId){
+  const o = byId(Z.objekte,objektId); if(!o) return;
+  _kpaErgebnis = null;
+  const k = o.kpa || {};
+  const kaufjahr = k.kaufjahr || (o.kaufdatum ? +o.kaufdatum.slice(0,4) : new Date().getFullYear());
+  const kpInklNk = (o.kaufpreisGesamtCent||0)-(o.kaufpreisBeweglichCent||0)+(o.kaufnebenkostenCent||0);
+  const artOpt = [["etw","Wohnungseigentum (ETW)"],["mfh","Mehrfamilienhaus"],["gemischt","Gemischt genutzt (25–75 % Wohnen)"],["efh","Ein-/Zweifamilienhaus, DHH, REH"]];
+  const nhkOpt = KPA_NHK.filter(x=>!["etw","mfh","gemischt"].includes(x[0])).map(x=>[x[0],x[1]]);
+  modal("Kaufpreisaufteilung (BMF-Arbeitshilfe, typisiert) — "+o.bezeichnung, `
+    <p class="hinweis">Typisierte Aufteilung des Kaufpreises in Gebäude sowie Grund und Boden nach der Methodik der BMF-Arbeitshilfe (Stand 02/2026): Verfahrensfolge Vergleichswert → Ertragswert → Sachwert, je nach vorhandenen Angaben. Qualifizierte Schätzung — durch Gutachten widerlegbar.</p>
+    <div class="zeile"><div>${auswahlFeld("kp_art","Grundstücksart",artOpt,k.grundArt||(o.typ==="Eigentumswohnung"?"etw":o.typ==="Einfamilienhaus"?"efh":"mfh"))}</div>
+    <div>${feld("kp_baujahr","Ursprüngliches Baujahr *",k.baujahr||o.baujahr,"number")}</div></div>
+    <div class="zeile"><div>${feld("kp_kaufjahr","Jahr des Kaufvertrags *",kaufjahr,"number")}</div>
+    <div>${feldG("kp_kp","Kaufpreis inkl. Nebenkosten",k.kaufpreisCent||kpInklNk||null)}</div></div>
+    <h3>Grund und Boden</h3>
+    <div class="zeile"><div>${feld("kp_f1","Grundstücksfläche in m² *",k.flaeche1)}</div><div>${feld("kp_brw1","Bodenrichtwert €/m² * (BORIS/Gutachterausschuss)",k.brw1)}</div></div>
+    <div class="zeile"><div>${feld("kp_f2","Weitere Teilfläche m² (z. B. Hinterland, optional)",k.flaeche2)}</div><div>${feld("kp_brw2","Wert €/m² dieser Teilfläche (oft 25 % des BRW)",k.brw2)}</div></div>
+    <div class="zeile"><div>${feld("kp_meaz","Miteigentumsanteil Zähler (nur ETW)",k.meaZ,"number")}</div><div>${feld("kp_mean","Miteigentumsanteil Nenner (nur ETW)",k.meaN,"number")}</div></div>
+    <h3>Gebäude</h3>
+    <div class="zeile"><div>${feld("kp_wf","Wohnfläche in m² *",k.wohnflaeche)}</div><div>${feld("kp_einheiten","Anzahl Wohneinheiten (MFH)",k.anzahlEinheiten,"number")}</div></div>
+    <div class="zeile"><div>${feld("kp_garagen","Anzahl Garagenstellplätze",k.anzahlGaragen,"number")}</div>
+    <div><label style="display:flex;align-items:center;gap:7px;margin-top:26px"><input type="checkbox" id="kp_zfh" style="width:auto" ${k.zfh?"checked":""}> Zweifamilienhaus (+5 % NHK)</label></div></div>
+    <div id="kp_nhk_wrap">${auswahlFeld("kp_nhk","Gebäudeart (nur EFH/DHH/REH, für Sachwertverfahren)",nhkOpt,k.nhkId||"efh101")}</div>
+    <h3>Verfahrensdaten (was vorliegt, wird genutzt: Vergleichs- → Ertrags- → Sachwert)</h3>
+    ${feld("kp_vf","Vergleichsfaktor €/m² Wohnfläche (falls vom Gutachterausschuss veröffentlicht)",k.vergleichsfaktor)}
+    ${feld("kp_vfg","Vergleichsfaktor € je Garagenstellplatz (optional)",k.vfGarage)}
+    ${feldG("kp_miete","Monatliche Nettokaltmiete gesamt inkl. Stellplätze (tatsächlich oder ortsüblich)",k.mieteMonatCent)}
+    <div class="zeile"><div>${feld("kp_lz","Liegenschaftszinssatz % (leer = typisiert)",k.lz)}</div><div>${feld("kp_index","Baupreisindex Kaufjahr (leer = hinterlegte Destatis-Reihe)",k.indexWert)}</div></div>
+    <div class="zeile"><div>${feld("kp_rf","Regionalfaktor (Standard 1,0)",k.regionalfaktor)}</div><div>${feld("kp_swf","Sachwertfaktor des Gutachterausschusses (Standard 1,0)",k.sachwertfaktor)}</div></div>
+    <div class="werkzeuge" style="margin-top:12px"><button class="primaer" onclick="kpaAuswerten('${objektId}')">Berechnen</button></div>
+    <div id="kpa_erg"></div>`,
+    "Aufteilung übernehmen", () => {
+      if (!_kpaErgebnis){ alert("Bitte zuerst „Berechnen“ klicken."); return false; }
+      if (!o.kaufpreisGesamtCent){ alert("Bitte zuerst den Kaufpreis unter „Kauf-/AfA-Daten“ erfassen — die Quote wird darauf angewendet."); return false; }
+      const basis = o.kaufpreisGesamtCent - (o.kaufpreisBeweglichCent||0);   // bewegliche Sachen gehören nicht zu Grund/Gebäude
+      const geb = Math.round(basis*_kpaErgebnis.quoteGebaeude);
+      o.kaufpreisGebaeudeCent = geb;
+      o.kaufpreisGrundCent = basis - geb;
+      o.kpa = _kpaErgebnis.eingaben;
+      geaendert();
+    });
+}
+function kpaEingabenLesen(){
+  const num = id => { const v = F(id).replace(/\./g,"").replace(",","."); const n = parseFloat(v); return isNaN(n)?0:n; };
+  return {grundArt:F("kp_art"), nhkId:F("kp_nhk")||"efh101", baujahr:+F("kp_baujahr")||0, kaufjahr:+F("kp_kaufjahr")||0,
+    kaufpreisCent:parseEuro(F("kp_kp"))||0, flaeche1:num("kp_f1"), brw1:num("kp_brw1"), flaeche2:num("kp_f2"), brw2:num("kp_brw2"),
+    meaZ:+F("kp_meaz")||0, meaN:+F("kp_mean")||0, wohnflaeche:num("kp_wf"), anzahlEinheiten:+F("kp_einheiten")||0,
+    anzahlGaragen:+F("kp_garagen")||0, zfh:FC("kp_zfh"), vergleichsfaktor:num("kp_vf"), vfGarage:num("kp_vfg"),
+    mieteMonatCent:parseEuro(F("kp_miete"))||0, lz:num("kp_lz")||(KPA_LZ[F("kp_art")]||3.5),
+    indexWert:num("kp_index"), regionalfaktor:num("kp_rf")||1, sachwertfaktor:num("kp_swf")||1};
+}
+function kpaAuswerten(objektId){
+  const e = kpaEingabenLesen();
+  if (!e.baujahr || !e.kaufjahr || !e.flaeche1 || !e.brw1 || !e.wohnflaeche){
+    document.getElementById("kpa_erg").innerHTML = '<p class="rot">Bitte mindestens Baujahr, Kaufjahr, Grundstücksfläche, Bodenrichtwert und Wohnfläche angeben.</p>';
+    return;
+  }
+  const r = kpaBerechnen(e);
+  _kpaErgebnis = {quoteGebaeude:r.quoteGebaeude, eingaben:e};
+  const kp = e.kaufpreisCent;
+  const d = r.details;
+  document.getElementById("kpa_erg").innerHTML = `
+    <h3>Ergebnis (${esc(r.verfahren)})</h3>
+    ${d.warnung?`<p class="rot">⚠ ${esc(d.warnung)}</p>`:""}
+    <table>
+      <tr><td>Bodenwert</td><td class="r">${euro(r.bodenwertCent)}</td></tr>
+      ${d.vergleichswertCent!=null?`<tr><td>Vergleichswert gesamt</td><td class="r">${euro(d.vergleichswertCent)}</td></tr>`:""}
+      ${d.rohertragCent!=null?`<tr><td>Jahresrohertrag / Bewirtschaftungskosten</td><td class="r">${euro(d.rohertragCent)} / ${euro(d.bewkCent)}</td></tr>
+      <tr><td>Bodenwertverzinsung (${(e.lz).toLocaleString("de-DE")} %) / Barwertfaktor (RND ${d.rnd} J.)</td><td class="r">${euro(d.bwVerzinsungCent)} / ${d.barwertfaktor.toLocaleString("de-DE")}</td></tr>`:""}
+      ${d.thkProM2!=null?`<tr><td>Typisierte Herstellungskosten je m² (indexiert ${d.indexWert.toLocaleString("de-DE")}, AWF ${(d.awf*100).toFixed(1)} %, RND ${d.rnd} J.)</td><td class="r">${euro(d.thkProM2*100)}</td></tr>`:""}
+      <tr><td>Wertanteil Gebäude</td><td class="r">${euro(r.gebaeudewertCent)}</td></tr>
+      <tr><td><b>Aufteilungsquote</b></td><td class="r"><b>Gebäude ${(r.quoteGebaeude*100).toLocaleString("de-DE",{maximumFractionDigits:2})} % · Grund ${((1-r.quoteGebaeude)*100).toLocaleString("de-DE",{maximumFractionDigits:2})} %</b></td></tr>
+      ${kp?`<tr><td><b>Auf Kaufpreis (${euro(kp)}) angewendet</b></td><td class="r"><b>Gebäude ${euro(Math.round(kp*r.quoteGebaeude))} · Grund ${euro(kp-Math.round(kp*r.quoteGebaeude))}</b></td></tr>`:""}
+    </table>
+    <p class="hinweis">„Aufteilung übernehmen" wendet die Quote auf den Kaufpreis (ohne Nebenkosten und ohne bewegliche Sachen) in den Kauf-/AfA-Daten an; die Nebenkosten verteilt die AfA-Berechnung automatisch in gleicher Quote.</p>`;
+  tabellenAnnotieren(document.getElementById("kpa_erg"));
+}
+
+/* ============ Seite: Steuer (Anlage V) ============ */
+function steuerDaten(objId, jahr){
+  const bs = Z.buchungen.filter(b=>b.objektId===objId && !b.istSoll && +b.datum.slice(0,4)===jahr);
+  const summe = kaId => bs.filter(b=>b.kostenartId===kaId).reduce((x,b)=>x+b.betragCent,0);
+  const o = byId(Z.objekte, objId);
+  const einnahmen = [];
+  const einZeile = (bez,cent) => { if (cent) einnahmen.push({bezeichnung:bez, betragCent:cent}); };
+  einZeile("Mieteinnahmen Wohnung (kalt)", summe("miete"));
+  einZeile("Garagen-/Stellplatzmiete", summe("garage"));
+  einZeile("Umlagen (NK-/Heizkosten-VZ, NK-Abrechnungssalden)", summe("nkvz")+summe("hzvz"));
+  for (const k of Z.kostenarten.filter(k=>k.istEinnahme && !["miete","garage","nkvz","hzvz"].includes(k.id)))
+    einZeile(k.bezeichnung, summe(k.id));
+  const afaCent = o ? (afaTabelle(o).find(z=>z.jahr===jahr)?.afaCent||0) : 0;
+  const wk = [];
+  const wkZeile = (bez,cent) => { if (cent) wk.push({bezeichnung:bez, betragCent:cent}); };
+  wkZeile("AfA Gebäude, linear (§7 Abs. 4 EStG)", -afaCent);
+  wkZeile("Schuldzinsen", summe("zins"));
+  wkZeile("Erhaltungsaufwendungen (Instandhaltung/Reparatur)", summe("inst"));
+  wkZeile("Verwaltungskosten", summe("verw"));
+  for (const k of Z.kostenarten.filter(k=>k.istUmlagefaehig))
+    wkZeile(k.bezeichnung+(k.betrKvNummer?` (BetrKV ${k.betrKvNummer})`:""), summe(k.id));
+  for (const k of Z.kostenarten.filter(k=>!k.istEinnahme && !k.istUmlagefaehig && !["zins","inst","verw","ruecklage"].includes(k.id)))
+    wkZeile(k.bezeichnung, summe(k.id));
+  const summeEin = einnahmen.reduce((x,z)=>x+z.betragCent,0);
+  const summeWk = wk.reduce((x,z)=>x+z.betragCent,0);
+  return {einnahmen, werbungskosten:wk, afaCent, ruecklageCent:summe("ruecklage"),
+    summeEinnahmenCent:summeEin, summeWerbungskostenCent:summeWk, ueberschussCent:summeEin+summeWk};
+}
+function rSteuer(){
+  if (!Z.objekte.length) return `<h2>Steuer (Anlage V)</h2><div class="karte"><div class="leer">Bitte zuerst ein Objekt anlegen.</div></div>`;
+  const objId = auswahl.stObjektId || Z.objekte[0].id;
+  auswahl.stObjektId = objId;
+  const jahre = [...new Set(Z.buchungen.filter(b=>b.objektId===objId&&!b.istSoll).map(b=>+b.datum.slice(0,4)))].sort((a,b)=>b-a);
+  const jahr = auswahl.stJahr || jahre[0] || new Date().getFullYear()-1;
+  auswahl.stJahr = jahr;
+  if (!jahre.includes(jahr)) jahre.unshift(jahr);
+  const d = steuerDaten(objId, jahr);
+  return `<h2>Steuer — Einnahmen/Werbungskosten (Anlage V)</h2>
+  <div class="werkzeuge">
+    <select style="width:auto" onchange="auswahl.stObjektId=this.value;delete auswahl.stJahr;rendern()">${Z.objekte.map(o=>`<option value="${o.id}" ${o.id===objId?"selected":""}>${esc(o.bezeichnung)}</option>`).join("")}</select>
+    <select style="width:auto" onchange="auswahl.stJahr=+this.value;rendern()">${jahre.map(j=>`<option ${j===jahr?"selected":""}>${j}</option>`).join("")}</select>
+    <button onclick="steuerDrucken('${objId}',${jahr})">🖨 Drucken (PDF)</button>
+  </div>
+  <div class="kennzahlen">
+    <div class="kennzahl"><div class="label">Einnahmen ${jahr}</div><div class="wert gruen">${euro(d.summeEinnahmenCent)}</div></div>
+    <div class="kennzahl"><div class="label">Werbungskosten</div><div class="wert rot">${euro(-d.summeWerbungskostenCent)}</div></div>
+    <div class="kennzahl"><div class="label">Überschuss/Verlust</div><div class="wert">${euroF(d.ueberschussCent)}</div></div>
+  </div>
+  <div class="karte"><h3 style="margin-top:0">Einnahmen (Zufluss ${jahr})</h3>
+    ${!d.einnahmen.length?'<div class="leer">Keine Einnahmen-Buchungen.</div>':
+    `<table><tr><th>Position</th><th class="r">Betrag</th></tr>
+    ${d.einnahmen.map(z=>`<tr><td>${esc(z.bezeichnung)}</td><td class="r">${euro(z.betragCent)}</td></tr>`).join("")}
+    <tr><td><b>Summe Einnahmen</b></td><td class="r"><b>${euro(d.summeEinnahmenCent)}</b></td></tr></table>`}</div>
+  <div class="karte"><h3 style="margin-top:0">Werbungskosten (Abfluss ${jahr})</h3>
+    ${!d.werbungskosten.length?'<div class="leer">Keine Ausgaben-Buchungen.</div>':
+    `<table><tr><th>Position</th><th class="r">Betrag</th></tr>
+    ${d.werbungskosten.map(z=>`<tr><td>${esc(z.bezeichnung)}</td><td class="r">${euro(-z.betragCent)}</td></tr>`).join("")}
+    <tr><td><b>Summe Werbungskosten</b></td><td class="r"><b>${euro(-d.summeWerbungskostenCent)}</b></td></tr></table>`}
+    ${d.ruecklageCent?`<p class="hinweis">Nachrichtlich: Zuführung Erhaltungsrücklage ${euro(-d.ruecklageCent)} — bei ETW steuerlich <b>nicht</b> im Zuführungsjahr abziehbar, sondern erst bei Verausgabung durch die WEG (nicht in der Summe enthalten).</p>`:""}
+  </div>
+  <p class="hinweis">Zuflussprinzip (§11 EStG): Es zählen die Ist-Buchungen des Kalenderjahrs. AfA monatsgenau ab Anschaffungsmonat. Angaben ohne Gewähr, keine Steuerberatung.</p>`;
+}
+function steuerDrucken(objId, jahr){
+  const o = byId(Z.objekte,objId); const d = steuerDaten(objId, jahr);
+  document.getElementById("druckbereich").innerHTML = `<div class="seite">
+    <h2>Einnahmen und Werbungskosten ${jahr} (Vorlage Anlage V)</h2>
+    <p><b>Objekt:</b> ${esc(o?.bezeichnung||"")}, ${esc(adresseText(o?.adresse))}</p>
+    <h3>Einnahmen</h3>
+    <table>${d.einnahmen.map(z=>`<tr><td>${esc(z.bezeichnung)}</td><td style="text-align:right">${euro(z.betragCent)}</td></tr>`).join("")}
+    <tr><td><b>Summe Einnahmen</b></td><td style="text-align:right"><b>${euro(d.summeEinnahmenCent)}</b></td></tr></table>
+    <h3>Werbungskosten</h3>
+    <table>${d.werbungskosten.map(z=>`<tr><td>${esc(z.bezeichnung)}</td><td style="text-align:right">${euro(-z.betragCent)}</td></tr>`).join("")}
+    <tr><td><b>Summe Werbungskosten</b></td><td style="text-align:right"><b>${euro(-d.summeWerbungskostenCent)}</b></td></tr></table>
+    <h3>Ergebnis</h3>
+    <table><tr><td><b>Überschuss/Verlust</b></td><td style="text-align:right"><b>${euro(d.ueberschussCent)}</b></td></tr></table>
+    ${d.ruecklageCent?`<p>Nachrichtlich: Zuführung Erhaltungsrücklage ${euro(-d.ruecklageCent)} (nicht abziehbar im Zuführungsjahr).</p>`:""}
+    <p style="font-size:10.5px">Zuflussprinzip §11 EStG · AfA monatsgenau ab Anschaffungsmonat · ohne Gewähr, keine Steuerberatung</p>
+  </div>`;
+  window.print();
 }
 
 /* ============ Seite: Bilanz ============ */
@@ -1688,6 +2150,9 @@ function rDaten(){
     </div>
     <p class="hinweis">${hatDateiApi?"Empfehlung: Die Datendatei im iCloud-Drive- oder OneDrive-Ordner anlegen — dann ist das Backup automatisch. Speichern jederzeit mit Strg+S."
     :"Auf dem iPhone/iPad: Änderungen werden automatisch im Gerät gespeichert. Zum Abgleich mit dem PC die Datei über „Aus iCloud öffnen“ laden und nach getaner Arbeit über „Nach iCloud exportieren“ → „In Dateien sichern“ zurücklegen."}</p></div>
+  <div class="karte"><h3 style="margin-top:0">Sicherungen (Schnappschüsse)</h3>
+    <p class="hinweis">Automatisch beim Laden einer Datendatei und alle 6 Stunden bei Änderungen — gespeichert im Browser dieses Geräts (letzte 5). Ersetzt keine Datei-Backups per Export.</p>
+    <div id="snapliste" class="hinweis">Lade …</div></div>
   <div class="karte"><h3 style="margin-top:0">Bestand</h3>
     <p>${n(Z.objekte)} Objekte · ${n(Z.wohneinheiten)} Wohneinheiten · ${n(Z.mietverhaeltnisse)} Mietverhältnisse · ${n(Z.kontakte)} Kontakte ·
     ${n(Z.buchungen)} Buchungen · ${n(Z.dokumente)} Dokumente · ${n(Z.wegs)} WEG · ${n(Z.nkAbrechnungen)} NK-Abrechnungen</p></div>
@@ -1697,12 +2162,22 @@ function rDaten(){
     <td>${k.istUmlagefaehig?"✓":"—"}</td><td>${k.betrKvNummer??"—"}</td><td>${k.istUmlagefaehig?verteilerName(k.standardVerteilerschluessel):"—"}</td></tr>`).join("")}</table></div>`;
 }
 
+window.nach_daten = async () => {
+  const el = document.getElementById("snapliste"); if(!el) return;
+  const keys = (await snapshotKeys()).sort().reverse();
+  el.innerHTML = !keys.length ? "Noch keine Schnappschüsse vorhanden." :
+    `<table><tr><th>Zeitpunkt</th><th></th></tr>${keys.map(k=>
+      `<tr><td>${new Date(k.slice(5)).toLocaleString("de-DE")}</td>
+      <td><button class="klein" onclick="snapshotWiederherstellen('${k}')">Wiederherstellen …</button></td></tr>`).join("")}</table>`;
+  tabellenAnnotieren(el);
+};
+
 /* ============ Start ============ */
 try{ const t = localStorage.getItem("immotool-theme"); if(t) document.documentElement.dataset.theme=t; }catch(e){}
 (async () => {
   if (!hatDateiApi){
     const gespeichert = await idbLaden();
-    if (gespeichert){ try{ Z = zustandMigrieren(Object.assign(neuerZustand(), JSON.parse(gespeichert))); }catch(e){} }
+    if (gespeichert){ try{ Z = zustandMigrieren(Object.assign(neuerZustand(), JSON.parse(gespeichert))); letzterSnapshot = Date.now(); snapshotSichern(); }catch(e){} }
   } else {
     const h = await handleLaden();
     if (h){
@@ -1711,6 +2186,7 @@ try{ const t = localStorage.getItem("immotool-theme"); if(t) document.documentEl
           dateiHandle = h;
           const f = await h.getFile();
           Z = zustandMigrieren(Object.assign(neuerZustand(), JSON.parse(await f.text())));
+          letzterSnapshot = Date.now(); snapshotSichern();
         } else {
           gemerkterHandle = h;
         }
