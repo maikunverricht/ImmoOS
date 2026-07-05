@@ -141,6 +141,7 @@ const SEED_KOSTENARTEN = (() => {
   const bk = (n,bez) => k("bk"+n, bez, false, true, n, (n===4||n===5||n===6)?VS_VERBRAUCH:VS_FLAECHE);
   return [
     k("miete","Mieteinnahme (Kalt)",true,false,null,VS_FLAECHE),
+    k("garage","Garagen-/Stellplatzmiete",true,false,null,VS_FLAECHE),
     k("nkvz","NK-Vorauszahlung",true,false,null,VS_FLAECHE),
     k("hzvz","Heizkosten-Vorauszahlung",true,false,null,VS_FLAECHE),
     k("inst","Instandhaltung/Reparatur",false,false,null,VS_FLAECHE),
@@ -163,6 +164,15 @@ function neuerZustand(){
     buchungen:[], dokumente:[], wegs:[], nkAbrechnungen:[] };
 }
 let Z = neuerZustand();
+
+/* Bestandsdaten nachrüsten: fehlende Seed-Kostenarten (z. B. "garage") an ihrer Seed-Position ergänzen */
+function zustandMigrieren(z){
+  if (!Array.isArray(z.kostenarten)) z.kostenarten = [];
+  SEED_KOSTENARTEN.forEach((s,i) => {
+    if (!z.kostenarten.some(k=>k.id===s.id)) z.kostenarten.splice(Math.min(i,z.kostenarten.length),0,JSON.parse(JSON.stringify(s)));
+  });
+  return z;
+}
 
 /* ---- Datei-Speicherung (File System Access API + Fallback) ---- */
 let dateiHandle = null, dirty = false, speicherTimer = null;
@@ -189,9 +199,7 @@ function ladeJson(text){
   try{
     const d = JSON.parse(text);
     if (!d.meta || !Array.isArray(d.objekte)) throw new Error("Keine ImmoTool-Datendatei.");
-    const basis = neuerZustand();
-    Z = Object.assign(basis, d);
-    if (!Z.kostenarten?.length) Z.kostenarten = basis.kostenarten;
+    Z = zustandMigrieren(Object.assign(neuerZustand(), d));
     if (!hatDateiApi){ dirty=true; idbSpeichern(); } else { dirty=false; }
     statusZeigen(); rendern();
   }catch(e){ alert("Datei konnte nicht gelesen werden: "+e.message); }
@@ -362,6 +370,9 @@ function kaltmieteAm(mv, datumIso){
 }
 const warmmieteAm = (mv, datumIso) => kaltmieteAm(mv, datumIso)+(mv.nkVorauszahlungCent||0)+(mv.heizkostenVorauszahlungCent||0);
 const warmmiete = mv => warmmieteAm(mv, heute());
+/* Gesamtmiete = Warmmiete + Garagen-/Stellplatzmiete (steuerlich getrennt verbucht) */
+const gesamtmieteAm = (mv, datumIso) => warmmieteAm(mv, datumIso)+(mv.garagenmieteCent||0);
+const gesamtmiete = mv => gesamtmieteAm(mv, heute());
 const mvAktivAm = (mv, isoVon, isoBis) => mv.mietbeginn <= isoBis && (!mv.mietende || mv.mietende >= isoVon);
 
 function sollErzeugen(jahr, monat){
@@ -373,9 +384,10 @@ function sollErzeugen(jahr, monat){
     if (!mvAktivAm(mv, von, bis)) continue;
     if (vorhandene.has(mv.id)) { schonDa++; continue; }
     const we = byId(Z.wohneinheiten, mv.wohneinheitId); if(!we) continue;
-    const betrag = warmmieteAm(mv, von); if(!betrag) continue;
+    const betrag = gesamtmieteAm(mv, von); if(!betrag) continue;
     Z.buchungen.push({id:uid(), datum:von, objektId:we.objektId, wohneinheitId:we.id,
       kostenartId:"miete", betragCent:betrag,
+      garagenAnteilCent:Math.min(mv.garagenmieteCent||0, betrag),
       bezeichnung:`Soll Miete ${jahr}-${String(monat).padStart(2,"0")} – ${we.bezeichnung}`,
       quelle:"SollStellung", quellenReferenzId:mv.id, kontaktId:mv.mieterId, istSoll:true, istAusgleichVonId:null});
     erzeugt++;
@@ -393,12 +405,24 @@ function mietStatus(jahr, monat){
 }
 function eingangBestaetigen(sollId, betragCent){
   const s = byId(Z.buchungen, sollId); if(!s||!s.istSoll) return;
-  const bereits = Z.buchungen.filter(b=>b.istAusgleichVonId===sollId&&!b.istSoll).reduce((a,b)=>a+b.betragCent,0);
+  const istBuchungen = Z.buchungen.filter(b=>b.istAusgleichVonId===sollId&&!b.istSoll);
+  const bereits = istBuchungen.reduce((a,b)=>a+b.betragCent,0);
   const offen = (betragCent ?? (s.betragCent-bereits));
   if (offen<=0) return;
-  Z.buchungen.push({id:uid(), datum:heute(), objektId:s.objektId, wohneinheitId:s.wohneinheitId,
-    kostenartId:s.kostenartId, betragCent:offen, bezeichnung:"Mieteingang (Ist) zu "+s.bezeichnung,
+  /* Garagen-/Stellplatzanteil (Snapshot aus der Soll-Buchung) steuerlich getrennt verbuchen.
+     Teilzahlungen werden anteilig gesplittet; die kumulierte Zielgröße verhindert Rundungsdrift. */
+  const garageSoll = Math.min(s.garagenAnteilCent||0, s.betragCent);
+  let garageTeil = 0;
+  if (garageSoll>0 && s.betragCent>0){
+    const bereitsGarage = istBuchungen.filter(b=>b.kostenartId==="garage").reduce((a,b)=>a+b.betragCent,0);
+    const zielGarage = Math.round(Math.min(bereits+offen, s.betragCent)*garageSoll/s.betragCent);
+    garageTeil = Math.max(0, Math.min(offen, zielGarage-bereitsGarage));
+  }
+  const neu = (kaId, betrag, bez) => Z.buchungen.push({id:uid(), datum:heute(), objektId:s.objektId, wohneinheitId:s.wohneinheitId,
+    kostenartId:kaId, betragCent:betrag, bezeichnung:bez,
     quelle:"SollStellung", quellenReferenzId:s.quellenReferenzId, kontaktId:s.kontaktId, istSoll:false, istAusgleichVonId:s.id});
+  if (offen-garageTeil>0) neu(s.kostenartId, offen-garageTeil, "Mieteingang (Ist) zu "+s.bezeichnung);
+  if (garageTeil>0) neu("garage", garageTeil, "Garagen-/Stellplatzmiete (Ist) zu "+s.bezeichnung);
   geaendert();
 }
 /* ============ UI-Gerüst: Navigation, Modal, Formulare ============ */
@@ -721,12 +745,12 @@ function rObjektDetail(o){
         <button class="klein" onclick="weDialog('${o.id}','${w.id}')">Bearbeiten</button>
         <button class="klein" onclick="mvDialog('${w.id}')">+ Mietverhältnis</button>
         <button class="klein gefahr" onclick="weLoeschen('${w.id}')">Löschen</button></div>
-      ${mvs.length?`<table style="margin-top:8px"><tr><th>Mieter</th><th>Zeitraum</th><th class="r">Kalt</th><th class="r">NK-VZ</th><th class="r">Heiz-VZ</th><th class="r">Warm</th><th class="r">Pers.</th><th></th></tr>
+      ${mvs.length?`<table style="margin-top:8px"><tr><th>Mieter</th><th>Zeitraum</th><th class="r">Kalt</th><th class="r">Garage</th><th class="r">NK-VZ</th><th class="r">Heiz-VZ</th><th class="r">Gesamt</th><th class="r">Pers.</th><th></th></tr>
       ${mvs.map(m=>`<tr ${m.mietende&&m.mietende<heute()?'class="muted"':''}>
         <td>${esc(kontaktName(m.mieterId))}</td>
         <td>${datumDE(m.mietbeginn)} – ${m.mietende?datumDE(m.mietende):"offen"}</td>
-        <td class="r">${euro(kaltmieteAm(m,heute()))}${(m.mieterhoehungen||[]).length?' <span class="chip" title="Mieterhöhungen erfasst">↑'+m.mieterhoehungen.length+'</span>':''}</td><td class="r">${euro(m.nkVorauszahlungCent||0)}</td>
-        <td class="r">${euro(m.heizkostenVorauszahlungCent||0)}</td><td class="r"><b>${euro(warmmiete(m))}</b></td>
+        <td class="r">${euro(kaltmieteAm(m,heute()))}${(m.mieterhoehungen||[]).length?' <span class="chip" title="Mieterhöhungen erfasst">↑'+m.mieterhoehungen.length+'</span>':''}</td><td class="r">${m.garagenmieteCent?euro(m.garagenmieteCent):"—"}</td><td class="r">${euro(m.nkVorauszahlungCent||0)}</td>
+        <td class="r">${euro(m.heizkostenVorauszahlungCent||0)}</td><td class="r"><b>${euro(gesamtmiete(m))}</b></td>
         <td class="r">${m.personenzahl||1}</td>
         <td style="white-space:nowrap"><button class="klein" onclick="mietErhDialog('${m.id}')">Miete ↑</button>
         <button class="klein" onclick="mvDialog('${w.id}','${m.id}')">Bearb.</button>
@@ -855,14 +879,16 @@ function mvDialog(weId, id){
   modal(id?"Mietverhältnis bearbeiten":"Neues Mietverhältnis", `
     ${auswahlFeld("mv_mieter","Mieter *",mieter.map(k=>[k.id,kontaktName(k.id)]),m.mieterId)}
     <div class="zeile"><div>${feld("mv_von","Mietbeginn *",m.mietbeginn,"date")}</div><div>${feld("mv_bis","Mietende (leer = unbefristet)",m.mietende,"date")}</div></div>
-    <div class="zeile"><div>${feldG("mv_kalt","Kaltmiete",m.kaltmieteCent)}</div><div>${feld("mv_pers","Personen",m.personenzahl,"number")}</div></div>
+    <div class="zeile"><div>${feldG("mv_kalt","Kaltmiete",m.kaltmieteCent)}</div><div>${feldG("mv_garage","Garagen-/Stellplatzmiete",m.garagenmieteCent)}</div></div>
     <div class="zeile"><div>${feldG("mv_nk","NK-Vorauszahlung",m.nkVorauszahlungCent)}</div><div>${feldG("mv_hz","Heizkosten-VZ",m.heizkostenVorauszahlungCent)}</div></div>
-    ${feldG("mv_kaution","Kaution (optional)",m.kautionCent)}`,
+    <div class="zeile"><div>${feldG("mv_kaution","Kaution (optional)",m.kautionCent)}</div><div>${feld("mv_pers","Personen",m.personenzahl,"number")}</div></div>
+    <p class="hinweis">Die Garagen-/Stellplatzmiete wird bei Soll-Stellung und Zahlungseingang automatisch als eigene Einnahmeart getrennt verbucht (steuerlicher Ausweis, z. B. Anlage V).</p>`,
     "Speichern", () => {
       if (!F("mv_von")){ alert("Mietbeginn angeben."); return false; }
       const ziel = id ? m : {id:uid(), wohneinheitId:weId};
       Object.assign(ziel,{mieterId:F("mv_mieter"), mietbeginn:F("mv_von"), mietende:F("mv_bis")||null,
         personenzahl:+F("mv_pers")||1, kaltmieteCent:parseEuro(F("mv_kalt"))||0,
+        garagenmieteCent:parseEuro(F("mv_garage"))||0,
         nkVorauszahlungCent:parseEuro(F("mv_nk"))||0, heizkostenVorauszahlungCent:parseEuro(F("mv_hz"))||0,
         kautionCent:parseEuro(F("mv_kaution"))});
       if (!id) Z.mietverhaeltnisse.push(ziel);
@@ -1574,7 +1600,7 @@ function rRendite(){
 }
 function renditeBerechnen(o, jahr){
   const bs = Z.buchungen.filter(b=>b.objektId===o.id && !b.istSoll && +b.datum.slice(0,4)===jahr);
-  const kalt = bs.filter(b=>b.kostenartId==="miete").reduce((x,b)=>x+b.betragCent,0);
+  const kalt = bs.filter(b=>b.kostenartId==="miete"||b.kostenartId==="garage").reduce((x,b)=>x+b.betragCent,0);
   const ein = bs.filter(b=>b.betragCent>0).reduce((x,b)=>x+b.betragCent,0);
   const aus = bs.filter(b=>b.betragCent<0).reduce((x,b)=>x+b.betragCent,0);
   const nichtUmlage = bs.filter(b=>b.betragCent<0 && !byId(Z.kostenarten,b.kostenartId)?.istUmlagefaehig).reduce((x,b)=>x+b.betragCent,0);
@@ -1676,6 +1702,23 @@ try{ const t = localStorage.getItem("immotool-theme"); if(t) document.documentEl
 (async () => {
   if (!hatDateiApi){
     const gespeichert = await idbLaden();
-    if (gespeichert){ try{ Z = Object.assign(neuerZustand(), JSON.parse(gespeichert)); }catch(e){} }
+    if (gespeichert){ try{ Z = zustandMigrieren(Object.assign(neuerZustand(), JSON.parse(gespeichert))); }catch(e){} }
   } else {
-    const h = await handl
+    const h = await handleLaden();
+    if (h){
+      try{
+        if (await h.queryPermission({mode:"readwrite"}) === "granted"){
+          dateiHandle = h;
+          const f = await h.getFile();
+          Z = zustandMigrieren(Object.assign(neuerZustand(), JSON.parse(await f.text())));
+        } else {
+          gemerkterHandle = h;
+        }
+      }catch(e){ gemerkterHandle = null; }
+    }
+  }
+  rendern();
+})();
+</script>
+</body>
+</html>
