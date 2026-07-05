@@ -1494,6 +1494,7 @@ function belegFormular(){
   const kaOpt = Z.kostenarten.filter(k=>!k.istEinnahme).map(k=>[k.id,k.bezeichnung+(k.betrKvNummer?` (BetrKV ${k.betrKvNummer})`:"")]);
   return `${profil?`<p>Erkanntes Profil: <span class="chip">${esc(profil.name)}</span>${belegText?"":" (kein Text — manuelle Eingabe)"}</p>`:
     '<p class="hinweis">Kein Text extrahierbar (Scan ohne Textebene?) — bitte Felder manuell ausfüllen.</p>'}
+    ${belegText?`<details style="margin:6px 0 10px"><summary style="cursor:pointer;font-size:.85em;color:var(--ak)">Erkannter Rohtext anzeigen (${belegText.length} Zeichen)</summary><pre style="white-space:pre-wrap;font-size:.75em;max-height:200px;overflow-y:auto;background:var(--bg2);border:1px solid var(--rand);border-radius:6px;padding:8px;margin-top:6px">${esc(belegText)}</pre></details>`:''}
     ${Z.objekte.length?auswahlFeld("bi_obj","Objekt *",Z.objekte.map(o=>[o.id,o.bezeichnung]),auswahl.biObjektId):'<p class="rot">Bitte zuerst ein Objekt anlegen!</p>'}
     ${auswahlFeld("bi_ka","Kostenart *",kaOpt,profil?.kostenartId||"inst")}
     <div class="zeile"><div>${feld("bi_datum","Belegdatum",datum,"date")}</div><div>${feldG("bi_betrag","Betrag",betrag)}</div></div>
@@ -1677,21 +1678,4 @@ try{ const t = localStorage.getItem("immotool-theme"); if(t) document.documentEl
     const gespeichert = await idbLaden();
     if (gespeichert){ try{ Z = Object.assign(neuerZustand(), JSON.parse(gespeichert)); }catch(e){} }
   } else {
-    const h = await handleLaden();
-    if (h){
-      try{
-        if (await h.queryPermission({mode:"readwrite"}) === "granted"){
-          dateiHandle = h;
-          const f = await h.getFile();
-          Z = Object.assign(neuerZustand(), JSON.parse(await f.text()));
-        } else {
-          gemerkterHandle = h;
-        }
-      }catch(e){ gemerkterHandle = null; }
-    }
-  }
-  rendern();
-})();
-</script>
-</body>
-</html>
+    const h = await handl
